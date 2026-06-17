@@ -1,0 +1,59 @@
+# ---- OS / editor ----
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+*.swp
+*.bak
+*.tmp
+*~
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.env
+
+# ---- Embedded / firmware build artifacts ----
+*.o
+*.obj
+*.elf
+*.hex
+*.cof
+*.map
+*.lst
+*.d
+*.i
+build/
+dist/
+debug/
+release/
+*.X/
+nbproject/private/
+
+# ---- KiCad: keep design sources, ignore generated/cache/backups ----
+*-backups/
+fp-info-cache
+*.kicad_prl
+*.lck
+~*.lck
+*.kicad_pcb-bak
+\#auto_saved_files#
+outputs/
+outputs*.zip
+
+# ---- Vendor SDKs (proprietary, not redistributed) ----
+# Pumpkin CubeSat Kit BSP and Salvo RTOS are commercial. See firmware/obc/BUILD.md.
+/vendor/
+
+# ---- Logs / misc ----
+*.log
+screenlog.*

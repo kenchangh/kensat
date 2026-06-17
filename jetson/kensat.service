@@ -1,0 +1,17 @@
+[Unit]
+Description=KENSAT inference daemon
+After=multi-user.target
+
+[Service]
+ExecStart=/opt/kensat/kensat_daemon.sh
+Type=simple
+User=ken
+Group=ken
+KillMode=process
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

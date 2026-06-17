@@ -1,0 +1,14 @@
+[Unit]
+Description=KENSAT early boot heartbeat over protocol UART
+DefaultDependencies=no
+After=local-fs.target
+Before=kensat.service basic.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'stty -F /dev/ttyTHS1 9600 cs8 -cstopb -parenb raw -echo -echoe -echok 2>/dev/null || true; printf "BOOT:kernel-up\\n" > /dev/ttyTHS1 || true'
+ExecStartPost=/bin/bash -c 'sleep 1; printf "BOOT:userspace-up\\n" > /dev/ttyTHS1 || true'
+
+[Install]
+WantedBy=multi-user.target

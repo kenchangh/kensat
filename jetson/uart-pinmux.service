@@ -1,0 +1,11 @@
+[Unit]
+Description=Set UART1 pinmux for PIC24 communication
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/bin/devmem_uart.py
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
