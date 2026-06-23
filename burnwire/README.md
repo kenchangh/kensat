@@ -16,10 +16,7 @@ implemented in [firmware/obc/app/task_beacon.c](../firmware/obc/app/task_beacon.
 
 ```
 burnwire/hardware/
-├── burnwire.kicad_pro / .kicad_sch / .kicad_pcb   KiCad design
-├── burnwire.csv                                   BOM
-├── burnwire_bom_jlc.csv / burnwire_cpl_jlc.csv    JLCPCB fabrication BOM + placement
-└── burnwire-all-pos.csv                           component placement
+└── burnwire.kicad_pro / .kicad_sch / .kicad_pcb   KiCad design
 ```
 
 Open with [KiCad](https://www.kicad.org/) 7+.

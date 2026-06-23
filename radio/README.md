@@ -100,19 +100,15 @@ This board is the RF subsystem of the KENSAT mission — a 2U CubeSat built to r
 
 ## Manufacturing
 
-Production files are generated for JLCPCB:
-
-- `kensat_radio.csv` — Bill of materials
-- `kensat_radio_jlc.csv` — JLCPCB-formatted BOM with LCSC part numbers
-- `kensat_radio-top-pos.csv` / `kensat_radio-top-pos_jlc.csv` — Component placement files
+Designed for fabrication at JLCPCB on standard 2-layer FR4. The BOM (with LCSC
+part numbers) and component-placement files are generated from the KiCad project
+with `rf-design/convert_to_jlcpcb.py`.
 
 ## Repository Structure
 
-- `hardware/` — KiCad board design and fabrication outputs
+- `hardware/` — KiCad board design
   - `kensat_radio.kicad_pro` / `.kicad_sch` / `.kicad_pcb` — project, schematic, PCB
   - `rf.kicad_sch` — RF front-end sub-schematic
-  - `kensat_radio.csv` / `kensat_radio_jlc.csv` — BOM (JLCPCB-formatted with LCSC parts)
-  - `kensat_radio-top-pos.csv` / `kensat_radio_all_pos.csv` — component placement
   - `kensat_radio.pdf`, `schematic.png` — rendered schematic
 - `firmware/esp32_si4463/` — ESP32-S3 transceiver firmware
   - `esp32_si4463.ino`, `si4463.cpp` / `si4463.h`, `config.h`

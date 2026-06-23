@@ -49,6 +49,8 @@ fp-info-cache
 \#auto_saved_files#
 outputs/
 outputs*.zip
+# Generated fabrication outputs (BOM / placement / JLCPCB exports)
+*/hardware/*.csv
 
 # ---- Vendor SDKs (proprietary, not redistributed) ----
 # Pumpkin CubeSat Kit BSP and Salvo RTOS are commercial. See firmware/obc/BUILD.md.
