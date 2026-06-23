@@ -13,7 +13,6 @@ the link, and run end-to-end tests against the flight hardware.
 | `beacon_decoder.py` | Decode the KENSAT AX.25 telemetry beacon |
 | `pluto_iq_capture.py` | Capture raw IQ to file for offline analysis |
 | `pluto_waterfall.py`, `pluto_wide_scan.py`, `pluto_freq_sweep.py` | Spectrum waterfall / scanning |
-| `find_carrier.py` | Locate the carrier / frequency offset |
 
 ## Transmit & stimulus
 
@@ -22,13 +21,6 @@ the link, and run end-to-end tests against the flight hardware.
 | `pluto_tx.py` | Pluto transmit |
 | `pluto_cw.py` | CW tone for path / antenna testing |
 | `send_x.py`, `serial_rssi_monitor.py` | Inject test traffic; monitor RSSI over serial |
-
-## DSP diagnostics
-
-`diagnose_*.py` — a toolbox for bringing up the demodulator from raw IQ:
-baud-rate estimation, correlation, sync-word search, energy/spectrum analysis,
-bit recovery, and brute-force parameter search. Built while debugging the link
-end to end.
 
 ## Test & visualization
 
