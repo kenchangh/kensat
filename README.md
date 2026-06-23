@@ -4,6 +4,10 @@
 > Jetson Orin Nano executes neural-network inference in space, and the results
 > are downlinked over a custom UHF radio link to amateur ground stations.
 
+<p align="center">
+  <img src="docs/images/kensat-flatsat.jpg" alt="The assembled KENSAT 2U CubeSat on the bench — Pumpkin chassis with body-mounted solar panels and a Remove-Before-Flight tag" width="600">
+</p>
+
 KENSAT's mission is to demonstrate **autonomous AI compute on a small
 satellite** — taking a GPU-class accelerator and a quantized LLM out of the
 data center and running them inside the tight power, thermal, and reliability
