@@ -1,20 +1,30 @@
-# KENSAT — A Single-Engineer 2U CubeSat
+# KENSAT — Edge-AI Compute in Orbit
 
-> An end-to-end 2U CubeSat — flight software, RF communications, power, attitude
-> sensing, antenna deployment, and an on-board edge-AI payload — designed,
-> built, and tested from first principles by one engineer.
+> A 2U CubeSat that runs a large language model on-orbit. A power-gated NVIDIA
+> Jetson Orin Nano executes neural-network inference in space, and the results
+> are downlinked over a custom UHF radio link to amateur ground stations.
 
-KENSAT is an independent 2U CubeSat developed outside any institutional
-framework. Every subsystem in this repository — the flight computer firmware,
-the custom UHF radio board and its RF matching networks, the electrical power
-system, the antenna-deployment hardware, the Jetson edge-AI payload, and the
-software-defined-radio ground station — was engineered, fabricated, and
-bench-tested by a single person on a COTS budget.
+KENSAT's mission is to demonstrate **autonomous AI compute on a small
+satellite** — taking a GPU-class accelerator and a quantized LLM out of the
+data center and running them inside the tight power, thermal, and reliability
+envelope of a 2U CubeSat. The on-board computer wakes the Jetson only when
+needed, runs an inference within a measured energy budget, and frames the
+output for downlink. Everything else in the spacecraft — the flight software,
+the UHF radio and its RF matching networks, the power system, and the
+antenna-deployment hardware — exists to get that compute on orbit, keep it
+alive, and get its results to the ground.
 
-**Mission:** a privately-owned satellite in a 520 km sun-synchronous orbit,
-operating UHF amateur radio at **437.08 MHz** for beaconing, telemetry
-downlink, and command uplink. Telemetry is intentionally **unencrypted** so
-amateur operators worldwide can receive and decode it.
+**Why it's hard.** Edge AI in orbit means treating a multi-watt accelerator as
+a scheduled, fault-tolerant *load*: powering it from a battery-backed bus only
+in defined windows, dissipating its heat passively in vacuum, recovering it if
+it hangs, and surviving the brownouts and resets that come with switching that
+much current on a small satellite. KENSAT is built end to end around that
+problem.
+
+**Mission profile:** a 520 km sun-synchronous orbit, operating UHF amateur
+radio at **437.08 MHz** for beaconing, telemetry downlink, and command uplink.
+Telemetry — including downlinked inference results — is intentionally
+**unencrypted** so amateur operators worldwide can receive and decode it.
 
 ---
 
@@ -65,21 +75,35 @@ budget, and thermal analysis.
 
 ## Engineering highlights
 
-- **Fault-tolerant antenna deployment.** The burn-wire release sequence is a
-  one-shot, flash-persisted state machine that survives brownouts and resets:
-  attempt counts are written *before* energizing, the "deployed" flag only
-  *after* a complete burn, and an RF-silence hold fails *safe* toward staying
-  quiet. Bounded to 3 retries. ([details](docs/system-architecture.md))
+- **An LLM running in orbit.** The payload is an NVIDIA Jetson Orin Nano running
+  a quantized TinyLlama model under llama.cpp. The always-on PIC24 keeps it
+  powered down, then — on schedule or command — switches on its rail through a
+  high-side load switch, waits for the Jetson to boot and signal `READY` over
+  UART, dispatches a prompt, collects the generated text, powers the Jetson back
+  off, and queues the result for downlink. The whole cycle is bounded by a
+  measured **per-inference energy budget** so a single run can't drain the pack.
+  ([docs/system-architecture.md §6.2](docs/system-architecture.md), [jetson/](jetson))
 
-- **RF from first principles.** TX / RX / antenna matching networks designed
-  with a custom scikit-rf grid-search optimizer that models PCB traces as CPWG
-  transmission lines (elliptic-integral method) and snaps to real LCSC part
-  values, then validated on an ADALM-Pluto SDR loopback bench
-  (gain sweep, harmonics, insertion loss). ([radio/rf-design](radio/rf-design))
+- **Treating a GPU as a spacecraft load.** Running multi-watt edge compute on a
+  2U bus is a systems problem: the EPS sizes a battery-backed rail and a
+  hardware watchdog around the Jetson's draw, the OBC power-gates it and can
+  recover a hung payload by cutting power, and the design accounts for
+  dissipating its heat **passively in vacuum**, where there's no convection.
+  ([docs/system-architecture.md §8.1](docs/system-architecture.md))
 
-- **Edge AI in orbit.** A Jetson Orin Nano payload runs a quantized LLM,
-  triggered and power-gated by the PIC24, with results downlinked as AX.25
-  frames — within a measured per-inference power budget.
+- **Fault-tolerant by construction.** Both the inference cycle and the antenna
+  burn-wire release are one-shot, flash-persisted state machines that survive
+  the brownouts and resets that come with switching large currents: attempt
+  counts are written *before* energizing, success flags only *after* completion,
+  and the RF-silence hold fails *safe* toward staying quiet.
+  ([details](docs/system-architecture.md))
+
+- **A complete UHF link to get results down.** TX / RX / antenna matching
+  networks were designed with a custom scikit-rf grid-search optimizer that
+  models PCB traces as CPWG transmission lines (elliptic-integral method) and
+  snaps to real LCSC part values, then validated on an ADALM-Pluto SDR loopback
+  bench (gain sweep, harmonics, insertion loss). Inference output is framed as
+  AX.25 and downlinked openly. ([radio/rf-design](radio/rf-design))
 
 - **Signal-integrity-aware bus design.** The Si4463 SPI bus crosses two
   board-to-board connectors; the design derates the clock and adds series

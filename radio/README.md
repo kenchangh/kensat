@@ -1,6 +1,6 @@
 # KENSAT Radio — UHF Transceiver Frontend for CubeSat Communications
 
-A custom-designed 437 MHz UHF radio frontend for the KENSAT 2U CubeSat, engineered from first principles to deliver high-performance bidirectional satellite communications using commercially available components. This board represents the RF communications subsystem of a fully independent, end-to-end CubeSat mission — designed, simulated, fabricated, and tested by a single engineer.
+A custom-designed 437 MHz UHF radio frontend for the KENSAT 2U CubeSat, engineered from first principles to deliver high-performance bidirectional satellite communications using commercially available components. This board is the communications link for KENSAT's edge-AI mission: it carries telemetry, commands, and the inference results produced by the satellite's on-board Jetson payload down to amateur ground stations.
 
 ## Technical Overview
 
@@ -89,14 +89,14 @@ Automated RF characterization is performed via an ADALM-Pluto SDR loopback testb
 
 ## Mission Context
 
-This board is part of the KENSAT mission — a fully independent 2U CubeSat developed outside any institutional framework. The mission spans RF communications, embedded flight software, power systems, and attitude determination and control, all designed and integrated by a single engineer. Key mission characteristics:
+This board is the RF subsystem of the KENSAT mission — a 2U CubeSat built to run **edge-AI compute in orbit**, executing LLM inference on a power-gated Jetson Orin Nano payload and downlinking the results. The radio is what closes the loop, carrying that compute output to the ground. Key mission characteristics:
 
+- **AI payload downlink** — inference results from the on-board Jetson are framed as AX.25 and transmitted over this link alongside telemetry
 - **Frequency coordination** through IARU for 437 MHz amateur satellite allocation
-- **Open telemetry architecture** — non-encrypted protocol stack enabling global amateur radio operators to receive and decode satellite data in real time
+- **Open telemetry architecture** — non-encrypted protocol stack enabling global amateur radio operators to receive and decode satellite data, including AI output, in real time
 - **Ground station integration** with commercial providers (RBC Signals) for global coverage
 - **Commercial launch** via SpaceX rideshare program
-- **Full COTS architecture** — demonstrating that meaningful space missions can be executed at component cost, without institutional or government backing
-- **First independent Malaysian satellite initiative** — expanding representation in the global small satellite ecosystem at the individual level
+- **Full COTS architecture** — demonstrating that meaningful space missions, and on-orbit AI compute, can be executed at component cost
 
 ## Manufacturing
 

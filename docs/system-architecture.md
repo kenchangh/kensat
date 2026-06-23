@@ -4,9 +4,9 @@
 
 ## 1. Mission Overview
 
-KENSAT is a 2U CubeSat mission to make Chan Guan Hao the first Malaysian private individual to launch a privately-owned satellite into orbit. The satellite operates in a 520 km sun-synchronous orbit (97.5° inclination, ~95 min period, 0 eccentricity). Purchases are made under Swordholder Technologies Inc. (Delaware corporation).
+KENSAT is a 2U CubeSat whose primary mission is to demonstrate **edge-AI compute in orbit**: running large-language-model inference on a power-gated NVIDIA Jetson Orin Nano payload and downlinking the results. The objective is to operate a GPU-class accelerator and a quantized LLM within the power, thermal, and reliability envelope of a small satellite — scheduling the Jetson as a fault-tolerant load, running an inference inside a bounded energy budget, and getting its output to the ground over an open UHF link. The satellite operates in a 520 km sun-synchronous orbit (97.5° inclination, ~95 min period, 0 eccentricity). The program is operated under Swordholder Technologies Inc. (Delaware corporation).
 
-The satellite uses UHF-only communications at 437.08 MHz (100 kbps, 2 kHz bandwidth) for beaconing, telemetry downlink, and command uplink. The amateur radio license (Technician class) is held by Chan Guan Hao, issued by the FCC.
+The satellite uses UHF-only communications at 437.08 MHz (100 kbps, 2 kHz bandwidth) for beaconing, telemetry downlink, and command uplink. Telemetry — including downlinked inference results — is unencrypted so amateur operators can receive it; the station operates under an FCC amateur radio license (Technician class).
 
 ## 2. Physical Stack
 
