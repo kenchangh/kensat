@@ -1,9 +1,10 @@
 # Burn-Wire Deployment Board
 
-Antenna-release board for KENSAT. On command from the OBC, it energizes
-**redundant nichrome burn wires** that melt through the fishing-line tether
-restraining the tape-measure dipole; the elements then spring outward into a
-straight half-wave dipole.
+Antenna-release board for KENSAT — **Slot 4, the top board in the 2U stack**.
+On command from the OBC, it drives **redundant resistive heating elements**
+(nichrome burn wires) that melt through the fishing-line tether restraining the
+tape-measure dipole; the elements then spring outward into a straight half-wave
+dipole.
 
 The release is driven by GPIO **IO.24** and **IO.25** from the PIC24, doubled
 for redundancy, held HIGH for ~10 s. The deployment sequence — including the

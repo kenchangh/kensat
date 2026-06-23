@@ -15,10 +15,11 @@ From bottom to top:
 | Slot | Board | Description |
 |------|-------|-------------|
 | 1 (bottom) | Pumpkin MB (P/N 710-00484 Rev E) + PPM D1 (P/N 710-00527) | OBC — always-on command & data handling |
-| 2 (middle) | Custom EPS Board | Power system with 2S2P 18650 batteries on underside |
-| 3 (top) | Custom Radio Board | Si4463 transceiver + Jetson Orin Nano (payload) |
+| 2 | Custom EPS Board | Power system with 2S2P 18650 batteries on underside |
+| 3 | Custom Radio Board | Si4463 transceiver + Jetson Orin Nano (payload) |
+| 4 (top) | Custom Burn-Wire Board | Antenna-release deployment driver — resistive heating elements melt the tether |
 
-All boards interconnect via the 104-pin CubeSat Kit Bus (headers H1 and H2, Samtec ESQ-126 series). The MB uses non-stackthrough connectors (slot 0 endpoint); the EPS and radio board use stackthrough connectors.
+All boards interconnect via the 104-pin CubeSat Kit Bus (headers H1 and H2, Samtec ESQ-126 series). The MB uses non-stackthrough connectors (slot 0 endpoint); the EPS, radio, and burn-wire boards use stackthrough connectors.
 
 **SPI signal integrity note:** The Si4463 SPI bus (IO.8–IO.11) crosses two board-to-board connectors (MB → EPS → Radio). Run the SPI clock at **1–2 MHz max** (not the Si4463's 10 MHz limit). On the radio board, keep traces from the bus connector to the Si4463 short (<20 mm), referenced to a ground plane, and add 33 Ω series resistors on MOSI and SCLK.
 

@@ -32,11 +32,14 @@ Telemetry — including downlinked inference results — is intentionally
 
 ```
         ┌──────────────────────────────────────────────┐
-        │  Radio Board (custom)                         │  Slot 3 (top)
+        │  Burn-Wire Board (custom)                     │  Slot 4 (top)
+        │  Antenna-release driver · resistive heating   │
+        ├──────────────────────────────────────────────┤
+        │  Radio Board (custom)                         │  Slot 3
         │  Si4463 UHF transceiver + AS179 T/R switch    │
         │  Jetson Orin Nano (edge-AI payload)           │
         ├──────────────────────────────────────────────┤
-        │  EPS Board (custom)                           │  Slot 2 (middle)
+        │  EPS Board (custom)                           │  Slot 2
         │  2S2P 18650 pack · rails · hardware watchdog  │
         ├──────────────────────────────────────────────┤
         │  Pumpkin MB + PPM D1 (PIC24FJ256GB210)        │  Slot 1 (bottom)

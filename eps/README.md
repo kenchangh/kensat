@@ -1,6 +1,6 @@
 # Electrical Power System (EPS)
 
-Custom EPS board for KENSAT — the middle board in the 2U stack. Generates and
+Custom EPS board for KENSAT — Slot 2 in the 2U stack, above the OBC. Generates and
 distributes the satellite's power rails, manages the battery pack, and provides
 a hardware watchdog that can power-cycle the rest of the spacecraft.
 
