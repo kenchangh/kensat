@@ -32,6 +32,29 @@ Telemetry — including downlinked inference results — is intentionally
 
 ---
 
+## Radio link (for receiving stations)
+
+KENSAT beacons openly on the UHF amateur band — no encryption, no keys.
+Anyone with a 70 cm receiver and a G3RUH-capable TNC (Direwolf, gr-satellites,
+SatNOGS) can decode it.
+
+| | |
+|---|---|
+| **Beacon / downlink frequency** | **437.080 MHz** |
+| **Transmitter** | Mode U — GFSK 1k2 AX.25 G3RUH |
+| **Modulation** | GFSK |
+| **Baud** | 1200 |
+| **Framing** | AX.25 UI, NRZI + G3RUH |
+| **Source callsign** | KO6IKZ |
+| **Beacon interval** | ~30 s |
+| **Status** | active |
+| **Encryption** | none — telemetry is open by design |
+
+Decoders and an end-to-end test harness live in
+**[ground-station](ground-station)**.
+
+---
+
 ## System at a glance
 
 ```
