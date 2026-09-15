@@ -537,23 +537,52 @@ static unsigned char si4463_set_properties(unsigned char group,
 /******************************************************************************
  si4463_configure_rf()
 
- Full RF configuration for 437.08 MHz GFSK 9600 bps, ±4.8 kHz deviation.
+ Full RF configuration for 437.08 MHz GFSK.
  Matches pluto_tx.py packet format:
    [Preamble 4B] [Sync 0x2DD4] [Len 1B] [Payload ≤64B] [CRC-16 2B]
 
- Ported from kensat_radio/esp32_si4463/si4463.cpp.
+ ASYMMETRIC LINK RATES -- READ BEFORE CHANGING ANY MODEM PROPERTY
+ ----------------------------------------------------------------
+ TX (downlink) runs at 1200 bps, ±601 Hz.  RX (uplink) stays at 9600 bps,
+ ±3004 Hz.  This is deliberate, not an oversight.
+
+ The downlink was dropped to 1200 bps to buy ~9 dB of link margin: the PA
+ on this board measures +12 dBm, not the +20 dBm the datasheet reference
+ match implies (PA_PWR_LVL is already 0x7F = max, so the shortfall is in
+ the match network, not the drive level), and at 9600 bps the 520 km link
+ does not close.  The uplink has no such problem -- it is limited by the
+ *ground* station's TX power, which is not the constraint -- so there is
+ nothing to gain by slowing it, and a great deal to lose.
+
+ The two directions are configured by DISJOINT property groups:
+   TX rate/deviation : MODEM_DATA_RATE (0x20/0x03..0x05), MODEM_FREQ_DEV
+                       (0x20/0x0C), with TX_NCO_MODE (0x20/0x06..0x09).
+   RX recovery       : MODEM_BCR_* (0x20/0x18..), MODEM_AFC_* (0x20/0x24,
+                       0x20/0x30), and the CHFLT taps (0x21/0x00..0x23).
+ Changing the TX pair therefore does NOT disturb uplink demodulation.
+
+ If you ever DO want the uplink at 1200 as well, the BCR/AFC/CHFLT blocks
+ must be regenerated in WDS for 1200 bps / ±360 Hz and replaced as a set.
+ Do not hand-edit them: the CHFLT values are FIR filter taps, not scalars,
+ and a partial edit yields a radio that still transmits but silently stops
+ hearing commands.  Keep ground-station/pluto_tx.py at 9600 to match this
+ block.
+ ----------------------------------------------------------------
+
+ Ported from radio/firmware/esp32_si4463/si4463.cpp.
 ******************************************************************************/
 static unsigned char si4463_configure_rf(void) {
 
     __builtin_clrwdt();
 
     // =====================================================================
-    // Based on WDS 3.2.11.0 config, MODIFIED for AX.25 / G3RUH 9k6:
-    //   - Deviation reduced from ±4.8 kHz to ±3.0 kHz (FREQ_DEV 0x150→0xD2)
+    // Based on WDS 3.2.11.0 config, MODIFIED for AX.25 / G3RUH:
+    //   - TX rate 9600 -> 1200 bps (DATA_RATE 0x05DC00 -> 0x00BB80)
+    //   - TX deviation ±4.8 kHz -> ±601 Hz (FREQ_DEV 0x150 -> 0x2A)
     //   - PREAMBLE_TX_LENGTH = 0 (we supply scrambled flag bytes in-band)
     //   - SYNC SKIP_TX = 1 (no chip-generated sync word)
     //   - FIELD_1_LENGTH = 0, FIELD_1/2_CRC_CONFIG = 0 (no chip framing/CRC)
-    // 437.08 MHz, 2-GFSK 9600 bps, source = FIFO.
+    // 437.08 MHz, 2-GFSK, TX 1200 bps / RX 9600 bps, source = FIFO.
     // Sync word bytes are still loaded in SYNC_BITS but never transmitted.
     // =====================================================================
 
@@ -641,16 +670,45 @@ static unsigned char si4463_configure_rf(void) {
 
     __builtin_clrwdt();
 
-    // MODEM 0x00-0x0B. FREQ_DEV bytes (offsets 0x0A..0x0C) scaled down from
-    // the WDS ±4.8 kHz value (0x000150 = 336) to ~±3.0 kHz (0x0000D2 = 210)
-    // to land on the G3RUH 9k6 convention used by Direwolf/SatNOGS.
-    // DATA_RATE — WDS-original 0x05DC00. Crystal is at nominal so no trim
-    // needed; baud rate ≈ 9600.
+    // MODEM 0x00-0x0B.  TX side only -- these two properties set the
+    // *transmit* symbol rate and deviation.  RX bit-clock recovery lives in
+    // the BCR/AFC/CHFLT blocks below and is deliberately left at 9600 (see
+    // the ASYMMETRIC LINK RATES note at the top of this function).
+    //
+    // DATA_RATE — WDS-original was 0x05DC00 (384000) for 9600 bps.  With
+    // TX_NCO_MODE unchanged (TXOSR = 40, NCOMOD = 30 MHz):
+    //     Rb = DATA_RATE * F_xtal / (TXOSR * NCOMOD) = DATA_RATE / 40
+    // so 1200 bps needs DATA_RATE = 1200 * 40 = 48000 = 0x00BB80.
     {
-        static const unsigned char d[] = { 0x03, 0x00, 0x07, 0x05, 0xDC, 0x00, 0x05, 0xC9, 0xC3, 0x80, 0x00, 0x00 };
+        static const unsigned char d[] = { 0x03, 0x00, 0x07, 0x00, 0xBB, 0x80, 0x05, 0xC9, 0xC3, 0x80, 0x00, 0x00 };
         si4463_set_properties(0x20, 0x00, d, 12);
     }
-    si4463_set_property(0x20, 0x0C, 0xD2);
+    // FREQ_DEV — TX deviation.  Scale is 14.31 Hz/unit on this board (the
+    // same slope as the FREQ_CONTROL FRAC shim below): 0xD2 = 210 gave
+    // ±3004 Hz, which is h = 2*3004/9600 = 0.63 at 9600 bps.
+    // 0x2A = 42 => ±601 Hz, i.e. h = 2*601/1200 = 1.00 at 1200 bps.
+    //
+    // WHY h = 1.0 AND NOT 0.6.  ±360 Hz (h = 0.6) was the first choice, to
+    // mirror the old 9600 modulation index.  Measured through the real
+    // satnogs_fsk_ax25 flowgraph, ±600 Hz is strictly better on both axes:
+    //
+    //   Eb/N0        16 dB    13 dB    11 dB      carrier offset  0 Hz  500 Hz
+    //   ±360 (h=0.6) 16/20    11/20     3/20                     10/10   1/10
+    //   ±600 (h=1.0) 19/20    18/20     7/20                     10/10   7/10
+    //
+    // ~2-3 dB of sensitivity and roughly double the usable carrier offset,
+    // for 2.4 kHz of occupied bandwidth instead of 1.9 kHz -- irrelevant in
+    // a 70 cm amateur allocation.  It also matches DELFI-PQ, the only flown
+    // 1200 bps AX.25/G3RUH satellite in the gr-satellites catalogue that
+    // declares a deviation at all (BINAR-1, KAFASAT and UmKA-1 omit it).
+    //
+    // Keep this in step with the `deviation:` field of the SatNOGS SatYAML
+    // entry published for KENSAT: that field sets gr-satellites' Carson
+    // pre-demod cutoff (|dev| + baud/2) AND
+    // its quadrature-demod gain, so a mismatch between the two costs frames.
+    // Leaving this at the 9600 value would give h = 2*3004/1200 = 5.0, far
+    // outside that filter.
+    si4463_set_property(0x20, 0x0C, 0x2A);
 
     // MODEM 0x18-0x23
     {
@@ -996,7 +1054,7 @@ void si4463_cmd_rx(void) {
 
     si4463_part_info();
 
-    si4463_debug_msg(STR_TASK_SI4463 "s: Configuring RF (437.08 MHz, GFSK 9600)...");
+    si4463_debug_msg(STR_TASK_SI4463 "s: Configuring RF (437.08 MHz, GFSK TX1200/RX9600)...");
     si4463_configure_rf();
 
     // Set GPIO for RX path: GPIO2=HIGH, GPIO3=LOW (cfg0, board default)
@@ -1228,7 +1286,7 @@ void si4463_cmd_tx(void) {
 
     si4463_part_info();
 
-    si4463_debug_msg(STR_TASK_SI4463 "x: Configuring RF (437.08 MHz, GFSK 9600)...");
+    si4463_debug_msg(STR_TASK_SI4463 "x: Configuring RF (437.08 MHz, GFSK TX1200/RX9600)...");
     si4463_configure_rf();
 
     // PA power for OTA testing
@@ -1298,11 +1356,14 @@ void si4463_cmd_tx(void) {
                 pkt_num, pkt_num, (unsigned int)payload_len);
         si4463_debug_msg(strTmp);
 
-        // Wait for TX complete.
+        // Wait for TX complete.  Bench-only test path (si4463_cmd_tx), not
+        // the flight beacon -- see si4463_tx_ax25() for that.
         // Packet = 64B preamble + 2B sync + 1B len + 11B payload + 2B CRC
-        //        = 640 bits @ 9600 bps = 66.7 ms.
-        // Each loop = 50000 NOPs @ 16 MHz FCY = 3.125 ms.
-        // 24 loops = 75 ms > 66.7 ms with ~8 ms margin.
+        //        = 640 bits, which at the new 1200 bps TX rate is 533 ms.
+        // Each loop is 50000 NOPs = ~102 ms measured (NOT the 3.125 ms the
+        // original comment assumed), so 24 loops = ~2.45 s.  Comfortably
+        // covers 533 ms; left as-is because this runs only on an operator
+        // command, but note it blocks the scheduler for ~2.4 s when used.
         {
             unsigned int d;
             unsigned char w;
@@ -1319,30 +1380,37 @@ void si4463_cmd_tx(void) {
 
 
 /******************************************************************************
- si4463_cmd_cw()
+ si4463_start_cw()
 
- Unmodulated continuous-wave carrier at 437.08 MHz for VNA S11 measurement.
- Press 'q' on the debug UART to stop.
+ One-shot: init the chip and bring up an unmodulated continuous-wave carrier
+ at 437.08 MHz, then return with the carrier still ON (chip parked in TX).
+ Shared by si4463_cmd_cw() (interactive) and task_beacon (boot-time SA test).
+ Returns 1 on success, 0 if any init step times out (carrier not running).
 ******************************************************************************/
-void si4463_cmd_cw(void) {
-    unsigned char cmd[7];
-    unsigned int hb;
+/* Defined later (used here for the CW diagnostic readback). */
+static unsigned char si4463_get_property(unsigned char group,
+                                         unsigned char start,
+                                         unsigned char count,
+                                         unsigned char *resp);
 
-    si4463_debug_msg(STR_TASK_SI4463 "c: Initializing SPI2...");
+unsigned char si4463_start_cw(void) {
+    unsigned char cmd[7];
+
+    si4463_debug_msg(STR_TASK_SI4463 "cw: Initializing SPI2...");
     spi2_init();
 
-    si4463_debug_msg(STR_TASK_SI4463 "c: Resetting Si4463...");
+    si4463_debug_msg(STR_TASK_SI4463 "cw: Resetting Si4463...");
     si4463_reset();
 
-    si4463_debug_msg(STR_TASK_SI4463 "c: Sending POWER_UP...");
+    si4463_debug_msg(STR_TASK_SI4463 "cw: Sending POWER_UP...");
     if (!si4463_power_up()) {
-        si4463_debug_msg(STR_TASK_SI4463 "c: POWER_UP CTS timeout!");
-        return;
+        si4463_debug_msg(STR_TASK_SI4463 "cw: POWER_UP CTS timeout!");
+        return 0;
     }
 
     si4463_part_info();
 
-    si4463_debug_msg(STR_TASK_SI4463 "c: Configuring RF (437.08 MHz)...");
+    si4463_debug_msg(STR_TASK_SI4463 "cw: Configuring RF (437.08 MHz)...");
     si4463_configure_rf();
 
     /* Override modulation: MODEM_MOD_TYPE (0x20/0x00) = 0x00
@@ -1350,10 +1418,10 @@ void si4463_cmd_cw(void) {
        This makes the PA emit a pure unmodulated carrier. */
     si4463_set_property(0x20, 0x00, 0x00);
 
-    /* PA at max for VNA visibility */
+    /* PA at max for SA/VNA visibility */
     si4463_set_property(0x22, 0x01, 0x7F);
 
-    si4463_debug_msg(STR_TASK_SI4463 "c: Setting RF switch to TX...");
+    si4463_debug_msg(STR_TASK_SI4463 "cw: Setting RF switch to TX...");
     si4463_gpio_cfg_tx();
 
     /* START_TX: channel 0, condition=0x00 (start immediately, NEXT_STATE=
@@ -1368,7 +1436,84 @@ void si4463_cmd_cw(void) {
     cmd[6] = 0x00;
     si4463_send_cmd(cmd, 7);
     if (!si4463_wait_cts()) {
-        si4463_debug_msg(STR_TASK_SI4463 "c: START_TX CTS timeout!");
+        si4463_debug_msg(STR_TASK_SI4463 "cw: START_TX CTS timeout!");
+        return 0;
+    }
+
+    /* Diagnostic: confirm the chip is actually parked in TX (0x07) and that
+       MOD_TYPE really latched to CW (0x00). If state reads back READY/other,
+       the PH completed and dropped us out of TX -> no continuous carrier. */
+    {
+        unsigned char dcmd[1];
+        unsigned char dresp[2];
+        unsigned char mod[1];
+
+        dcmd[0] = SI4463_CMD_REQUEST_DEVICE_STATE;
+        si4463_send_cmd(dcmd, 1);
+        if (si4463_read_response(dresp, 2)) {
+            sprintf(strTmp, STR_TASK_SI4463 "cw: device state=0x%02X chan=%u "
+                    "(0x07=TX expected)",
+                    dresp[0], (unsigned int)dresp[1]);
+            si4463_debug_msg(strTmp);
+        }
+        if (si4463_get_property(0x20, 0x00, 1, mod)) {
+            sprintf(strTmp, STR_TASK_SI4463 "cw: MOD_TYPE=0x%02X (0x00=CW)",
+                    mod[0]);
+            si4463_debug_msg(strTmp);
+        }
+    }
+
+    si4463_debug_msg(STR_TASK_SI4463 "cw: CW carrier ON at 437.08 MHz.");
+    return 1;
+}
+
+
+/******************************************************************************
+ si4463_cw_keepalive()
+
+ Reads the current device state and, if the chip has fallen out of TX (e.g.
+ the packet handler completed its configured field length and transitioned to
+ READY), re-issues START_TX to re-key the CW carrier. Returns the state read
+ BEFORE any re-key (0x07 = was still in TX; 0xFF = state read failed).
+******************************************************************************/
+unsigned char si4463_cw_keepalive(void) {
+    unsigned char dcmd[1];
+    unsigned char dresp[2];
+    unsigned char cmd[7];
+
+    dcmd[0] = SI4463_CMD_REQUEST_DEVICE_STATE;
+    si4463_send_cmd(dcmd, 1);
+    if (!si4463_read_response(dresp, 2)) {
+        return 0xFF;
+    }
+
+    if (dresp[0] != SI4463_STATE_TX) {
+        /* Carrier dropped — re-key. */
+        cmd[0] = SI4463_CMD_START_TX;
+        cmd[1] = 0x00;
+        cmd[2] = 0x00;
+        cmd[3] = 0x00;
+        cmd[4] = 0x00;
+        cmd[5] = 0x00;
+        cmd[6] = 0x00;
+        si4463_send_cmd(cmd, 7);
+        si4463_wait_cts();
+    }
+
+    return dresp[0];
+}
+
+
+/******************************************************************************
+ si4463_cmd_cw()
+
+ Unmodulated continuous-wave carrier at 437.08 MHz for VNA S11 measurement.
+ Press 'q' on the debug UART to stop.
+******************************************************************************/
+void si4463_cmd_cw(void) {
+    unsigned int hb;
+
+    if (!si4463_start_cw()) {
         return;
     }
 
@@ -1420,8 +1565,9 @@ static unsigned char si4463_get_property(unsigned char group,
 
 /* Direct UART writer used only by si4463_cmd_get_props — sidesteps
    csk_uart1_msg_ts's tx_free busy-wait, which destabilises the system
-   when called rapidly back-to-back (see CLAUDE.md). uart2_puts blocks
-   per-char on TX-empty, so back-to-back calls are self-throttling. */
+   when called rapidly back-to-back (see "Known issues" in
+   firmware/obc/README.md). uart2_puts blocks per-char on TX-empty, so
+   back-to-back calls are self-throttling. */
 static void dump_props_line(const char *s) {
     csk_uart1_puts(s);
     csk_uart1_puts(STR_CRLF);
@@ -1590,8 +1736,13 @@ void task_si4463_rx(void) {
 
         si4463_set_mode(SI4463_MODE_RX);
 
-        // Wait ~10 seconds, yielding to scheduler
-        OS_Delay(1000);
+        // Wait ~10 seconds, yielding to scheduler. Split into <=255-tick chunks
+        // because Salvo Pro-lib delays are 8-bit (OSBYTES_OF_DELAYS=1) and
+        // OS_Delay(1000) would truncate mod 256 to 232 ticks. 4 x 250 = 1000.
+        OS_Delay(250);
+        OS_Delay(250);
+        OS_Delay(250);
+        OS_Delay(250);
 
         si4463_set_mode(SI4463_MODE_READY);
 
@@ -1602,6 +1753,189 @@ void task_si4463_rx(void) {
 #endif
 
 } /* task_si4463_rx() */
+
+
+/******************************************************************************
+****                                                                       ****
+**                                                                           **
+Half-duplex uplink support
+
+There is one radio and one owner (task_beacon), so listening simply means
+parking the chip in RX during the gap between beacons and dropping back to
+READY/TX when it is time to transmit.  Two things have to be switched every
+time the direction changes:
+
+  1. The AS179 RF switch (Si4463 GPIO2/GPIO3) -- si4463_gpio_cfg_rx/tx().
+
+  2. The packet-handler FIELD config, group 0x12 offsets 0x0C..0x17.  The
+     downlink is AX.25/G3RUH, which needs the packet handler OUT of the way:
+     si4463_configure_rf() leaves FIELD_1_LENGTH = 0 and both CRC configs at
+     0 so the chip serialises raw FIFO bytes and si4463_tx_ax25() supplies
+     its own flags, bit-stuffing, NRZI, scrambling and FCS.  Receiving that
+     same format would mean descrambling and running HDLC over a raw bit
+     stream in software, which the Si4463's packet handler cannot do for us.
+
+     So the UPLINK deliberately uses the chip's native framing instead --
+     preamble + sync 0x2DD4 + 1-byte length + payload + CRC-16 CCITT -- which
+     is the format si4463_cmd_rx() has always used and that
+     ground-station/pluto_tx.py already generates.  That needs
+     FIELD_1_LENGTH = 1 with CRC_START, and FIELD_2 with SEND_CRC/CHECK_CRC,
+     so the two field configs are swapped in and out around every
+     transmission.
+
+Downlink stays AX.25 (SatNOGS-decodable); uplink is the simple Si4463 frame.
+
+**                                                                           **
+****                                                                       ****
+******************************************************************************/
+
+/* Latched RSSI of the most recently received packet (raw Si4463 units;
+   dBm ~= raw/2 - 134).  Zero until something is heard. */
+static unsigned char si4463_rx_rssi = 0;
+
+
+/* Packet-handler FIELD config for the AX.25 downlink: field 1 emits nothing,
+   field 2 is raw FIFO bytes with no chip-side CRC.  si4463_tx_ax25() still
+   overwrites FIELD_2_LENGTH per frame. */
+static void si4463_pkt_cfg_tx(void) {
+    static const unsigned char d[] =
+        { 0x30, 0x00, 0x00, 0x04, 0x00, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    si4463_set_properties(0x12, 0x0C, d, 12);
+}
+
+
+/* Packet-handler FIELD config for the uplink: field 1 = 1-byte length
+   (CRC_START + CRC_ENABLE, not sent), field 2 = up to 63 B payload
+   (CRC_START + SEND_CRC + CRC_ENABLE, i.e. CHECK_CRC on RX). */
+static void si4463_pkt_cfg_rx(void) {
+    static const unsigned char d[] =
+        { 0x30, 0x00, 0x01, 0x04, 0x82, 0x00, 0x3F, 0x00, 0xA2, 0x00, 0x00, 0x00 };
+    si4463_set_properties(0x12, 0x0C, d, 12);
+}
+
+
+/******************************************************************************
+ si4463_rx_enable()
+
+ Point the RF switch at the RX port, install the uplink packet-handler
+ config, flush both FIFOs, clear stale interrupts and arm RX.  Called at the
+ top of every listening window so the chip's state is deterministic even if a
+ previous packet or a glitch left it somewhere unexpected.
+
+ Contains no OS_Delay -- safe to call from a Salvo helper.
+ Returns 1 if START_RX was accepted.
+******************************************************************************/
+unsigned char si4463_rx_enable(void) {
+    si4463_change_state(SI4463_STATE_READY);
+    si4463_pkt_cfg_rx();
+    si4463_gpio_cfg_rx();
+    si4463_fifo_info(0x03);          /* reset TX + RX FIFOs */
+    si4463_get_int_status();         /* clear anything still pending */
+    return si4463_start_rx();
+}
+
+
+/******************************************************************************
+ si4463_rx_disable()
+
+ Leave RX, restore the AX.25 field config and point the RF switch back at
+ the PA.  Call before any si4463_tx_ax25().
+
+ Contains no OS_Delay -- safe to call from a Salvo helper.
+******************************************************************************/
+void si4463_rx_disable(void) {
+    si4463_change_state(SI4463_STATE_READY);
+    si4463_pkt_cfg_tx();
+    si4463_gpio_cfg_tx();
+}
+
+
+/******************************************************************************
+ si4463_rx_poll()
+
+ Non-blocking check for one received uplink frame.  Returns the payload
+ length copied into buf (0 if nothing arrived), and re-arms RX itself.
+
+ Cheap in the common case: nIRQ is a plain GPIO read, so a quiet poll costs
+ no SPI traffic at all.  START_RX was issued with RXVALID_STATE = READY, so
+ the chip parks after a good packet and has to be re-armed -- which is done
+ here, before the payload is copied out, to minimise the deaf window.
+
+ A modem-only interrupt (preamble / sync detect, i.e. a packet part-way in)
+ is NOT re-armed: the chip is still in RX and restarting it would throw away
+ the frame currently being demodulated.  GET_INT_STATUS has already cleared
+ the pending bits, so nIRQ deasserts and the next poll sees a clean state.
+
+ Contains no OS_Delay -- safe to call from a Salvo helper.
+******************************************************************************/
+unsigned char si4463_rx_poll(unsigned char *buf, unsigned char maxlen) {
+    static unsigned char fifo_buf[RX_FIFO_BUF_SIZE];
+    unsigned char ph_pend;
+    unsigned char n, plen, i;
+
+    if (SI4463_NIRQ_READ() != 0) {
+        return 0;                    /* quiet -- no SPI transaction at all */
+    }
+
+    ph_pend = si4463_get_int_status();     /* also clears all pending IRQs */
+
+    if (ph_pend & SI4463_PH_PEND_CRC_ERROR) {
+        /* Corrupt frame: bin it and listen again. */
+        si4463_fifo_info(0x02);
+        si4463_start_rx();
+        return 0;
+    }
+
+    if (!(ph_pend & SI4463_PH_PEND_PACKET_RX)) {
+        return 0;                    /* modem-only event; still in RX */
+    }
+
+    n = si4463_fifo_info(0);
+    if (n > RX_FIFO_BUF_SIZE) n = RX_FIFO_BUF_SIZE;
+    if (n > 0) {
+        si4463_read_rx_fifo(fifo_buf, n);
+    }
+
+    /* Latched RSSI for this packet: GET_MODEM_STATUS response byte 3.
+       Must be read before RX is re-armed or it is overwritten. */
+    {
+        unsigned char cmd[2];
+        unsigned char resp[8];
+        cmd[0] = SI4463_CMD_GET_MODEM_STATUS;
+        cmd[1] = 0x00;
+        si4463_send_cmd(cmd, 2);
+        if (si4463_read_response(resp, 8)) {
+            si4463_rx_rssi = resp[3];
+        }
+    }
+
+    si4463_fifo_info(0x02);          /* drop any residue */
+    si4463_start_rx();               /* back to listening straight away */
+
+    /* FIFO layout after a good packet: [length byte][payload...].
+       The CRC is checked by the chip and not stored. */
+    if (n < 2) {
+        return 0;
+    }
+    plen = fifo_buf[0];
+    if (plen > (unsigned char)(n - 1)) plen = (unsigned char)(n - 1);
+    if (plen > maxlen)                plen = maxlen;
+
+    for (i = 0; i < plen; i++) {
+        buf[i] = fifo_buf[1 + i];
+    }
+    return plen;
+}
+
+
+/******************************************************************************
+ si4463_last_rssi()
+
+ Raw latched RSSI of the last received uplink frame (dBm ~= raw/2 - 134).
+******************************************************************************/
+unsigned char si4463_last_rssi(void) {
+    return si4463_rx_rssi;
+}
 
 
 /******************************************************************************
@@ -1647,7 +1981,7 @@ void si4463_init_beacon(void) {
 /******************************************************************************
  si4463_tx_ax25()
 
- Transmits one AX.25 UI frame over G3RUH 9k6 GFSK. info[] is the AX.25
+ Transmits one AX.25 UI frame over G3RUH 1k2 GFSK. info[] is the AX.25
  info field (typically an ASCII telemetry line). The full frame
  (preamble flags + addr + ctrl/PID + info + FCS + tail flags, NRZI
  + G3RUH scrambled) is rendered in a static scratch buffer and shoved
@@ -1658,8 +1992,9 @@ void si4463_init_beacon(void) {
  RF switch is on the TX port. Coerces RX→READY first if necessary.
  Leaves the chip in READY after TX (START_TX condition 0x30).
 
- A hex dump of the encoded bytes is printed to the debug UART so the
- OTA capture can be correlated against what was actually shifted out.
+ In verbose console mode ('q') a hex dump of the encoded bytes is printed
+ to the debug UART so the OTA capture can be correlated against what was
+ actually shifted out.
 ******************************************************************************/
 void si4463_tx_ax25(const unsigned char *info, unsigned int info_len) {
     static unsigned char ax25_buf[512];
@@ -1670,7 +2005,8 @@ void si4463_tx_ax25(const unsigned char *info, unsigned int info_len) {
     __builtin_clrwdt();
 
     /* Build the AX.25 bit stream (preamble flags + frame + tail flags,
-       stuffed + NRZI + G3RUH scrambled, packed LSB-first). */
+       stuffed + NRZI + G3RUH scrambled, packed MSB-first to match the
+       chip's MSB-first FIFO shift-out). */
     enc_len = ax25_build_ui(AX25_DST_CALL, AX25_DST_SSID,
                             AX25_SRC_CALL, AX25_SRC_SSID,
                             info, info_len,
@@ -1680,10 +2016,20 @@ void si4463_tx_ax25(const unsigned char *info, unsigned int info_len) {
         return;
     }
 
-    /* If something left the chip in RX, drop to READY before TX. */
+    /* If something left the chip in RX, drop to READY before TX, and make
+       sure the packet handler is in raw-FIFO (AX.25) mode -- the uplink
+       listening window swaps in a different FIELD config (see
+       si4463_pkt_cfg_rx()) and must never be left in place for a downlink. */
     si4463_change_state(SI4463_STATE_READY);
+    si4463_pkt_cfg_tx();
 
-    /* Hex dump the encoded bytes, 16 per line. */
+    /* Hex dump the encoded bytes, 16 per line.  ~6 lines of ~70 chars is
+       ~500 chars; at 9600 baud that is ~0.5 s per frame in which
+       si4463_debug_msg busy-waits on TX ring space and the CPU cannot idle,
+       so it is off unless the console is in verbose mode ('q').  The ground
+       station decodes the actual RF, so this is a correlation aid, not the
+       record. */
+    if (g_console_verbose) {
     for (row = 0; row < enc_len; row += 16) {
         char *p = strTmp;
         unsigned int end = row + 16;
@@ -1713,6 +2059,7 @@ void si4463_tx_ax25(const unsigned char *info, unsigned int info_len) {
         *p = '\0';
         si4463_debug_msg(strTmp);
     }
+    }
 
     /* Set FIELD_2_LENGTH to the encoded byte count (can exceed 255 for
        large frames, so program both halves). FIELD_1_LENGTH is already
@@ -1729,11 +2076,13 @@ void si4463_tx_ax25(const unsigned char *info, unsigned int info_len) {
         si4463_wait_cts();
     }
 
-    /* Stream encoded bytes into the FIFO. The Si4463 holds up to 64 B
-       in the TX FIFO; for AX.25 frames longer than that, we'd need to
-       wait on FIFO_ALMOST_EMPTY between bursts. ASCII beacons are
-       well under 64 B encoded once you count overhead — but commit a
-       chunked write so longer info fields don't underflow. */
+    /* Stream encoded bytes into the FIFO. The Si4463 holds only 64 B in
+       the TX FIFO, and an encoded frame always exceeds that: the 16
+       leading flags alone are 16 B, and a routine ~78 B ASCII beacon
+       encodes to ~117 B (a full 179 B info field reaches ~218 B). So the
+       refill loop below runs on EVERY frame, not just oversized ones --
+       seed the FIFO with the first 60 B here, then top it up as the chip
+       drains it. */
     SI4463_CS_LOW();
     { unsigned int d; for (d = 0; d < 50; d++) { __builtin_nop(); } }
     spi2_transfer(SI4463_CMD_WRITE_TX_FIFO);
@@ -1767,17 +2116,46 @@ void si4463_tx_ax25(const unsigned char *info, unsigned int info_len) {
 
         /* Let the chip settle into TX before we start polling FIFO_INFO.
            Without this, the first FIFO_INFO can return CTS-late and used
-           to exit the loop prematurely. */
-        { unsigned int d; for (d = 0; d < 16000u; d++) { __builtin_nop(); } }
+           to exit the loop prematurely.  ~2 ms is ample (see the timing
+           note below); this was 16000 iterations = ~33 ms, which burned
+           most of the FIFO's 53 ms of buffered airtime before the first
+           top-up even happened. */
+        { unsigned int d; for (d = 0; d < 1000u; d++) { __builtin_nop(); } }
 
-        /* Top up the FIFO as the chip drains it. At 9600 bps each byte
-           takes ~833 us, so the 64 B FIFO drains in ~53 ms. Safety budget
-           ≈ 1.5 s — longer than any plausible encoded frame's airtime.
-           A transient FIFO_INFO CTS timeout used to `break` out of the
-           loop (and we'd stop with only the initial 60 bytes sent); now
-           we continue and let the safety counter bound retries. */
+        /* Top up the FIFO as the chip drains it. At 1200 bps each byte
+           takes ~6.67 ms, so the 64 B FIFO drains in ~427 ms (it was ~53 ms
+           at 9600). Safety budget
+           bounds retries; a transient FIFO_INFO CTS timeout does not break
+           out of the loop (that used to stop the frame after the initial
+           60 bytes).
+
+           NOP-LOOP TIMING: measured on this board, `for (d=0; d<50000u;
+           d++) nop;` takes ~102 ms -- about 2.05 us per iteration, ~33x
+           slower than the 3.125 ms/50k that the original waits here
+           assumed.  The back-off below was 48000 iterations, i.e. ~98 ms:
+           nearly twice the time it takes the chip to drain the entire
+           FIFO.  The result was a deterministic underflow -- Pluto capture
+           showed every frame transmitting 96.0 ms of real data followed by
+           ~9 ms of unmodulated carrier, so the last ~10 bytes (including
+           the FCS) never went out and no frame ever validated on the
+           ground.  Keep every wait in this loop small relative to the
+           427 ms drain time. */
         {
-            unsigned int safety = 500;
+            /* SAFETY BUDGET at 1200 bps.  The worst frame this encoder can
+               emit is 218 B; after the initial 64 B fill, the remaining
+               154 B drain in 154*8/1200 = 1.03 s.  Each back-off spin is
+               ~2.2 ms (1000 nops @ ~2.05 us + one FIFO_INFO transaction),
+               so a healthy worst-case frame needs ~470 spins -- the old
+               500 was only 1.1x that and would have tripped the "FIFO
+               refill timeout" path on long frames.
+
+               2000 gives 4.3x headroom.  Do NOT simply scale this with the
+               baud drop (500 -> 4000): this counter also bounds how long a
+               *sick* radio can block the cooperative scheduler, and
+               4000 * 2.2 ms = 8.8 s would consume almost the entire 9.0 s
+               of late margin task_wdt has against the TPS3430's ~55 s
+               window.  2000 caps a pathological stall at ~4.4 s. */
+            unsigned int safety = 2000;
             unsigned int read_fails = 0;
             while (sent < enc_len && safety-- > 0) {
                 unsigned char cmd[2];
@@ -1791,16 +2169,19 @@ void si4463_tx_ax25(const unsigned char *info, unsigned int info_len) {
                 si4463_send_cmd(cmd, 2);
                 if (!si4463_read_response(resp, 2)) {
                     read_fails++;
-                    /* short wait then retry, don't bail */
+                    /* short wait then retry, don't bail (~2 ms) */
                     unsigned int d;
-                    for (d = 0; d < 16000u; d++) { __builtin_nop(); }
+                    for (d = 0; d < 1000u; d++) { __builtin_nop(); }
                     continue;
                 }
                 free_space = resp[1];
 
                 if (free_space < 16) {
+                    /* ~2 ms back-off: short against the 53 ms it takes the
+                       chip to drain a full FIFO, so we never sleep through
+                       the tail of a frame. */
                     unsigned int d;
-                    for (d = 0; d < 48000u; d++) { __builtin_nop(); }
+                    for (d = 0; d < 1000u; d++) { __builtin_nop(); }
                     continue;
                 }
 
@@ -1825,13 +2206,39 @@ void si4463_tx_ax25(const unsigned char *info, unsigned int info_len) {
     sprintf(strTmp, STR_TASK_SI4463 "ax25: TX %u bytes", enc_len);
     si4463_debug_msg(strTmp);
 
-    /* Wait for TX complete. Worst case at 9600 bps:
-       512 B * 8 = 4096 bits = 426 ms. Budget 600 ms with margin.
-       Each loop = ~3.125 ms; 200 loops = ~625 ms. */
+    /* Wait for TX complete.
+
+       CALIBRATION: the inner loop was assumed to run at ~3.125 ms per
+       outer iteration, so 200 iterations were meant to be ~625 ms.  Timed
+       against the console (tick stamps + host clock), 200 iterations
+       actually take ~20.4 s -- ~102 ms per outer iteration, 33x the
+       estimate.  That blocked the cooperative scheduler for 20 s per
+       beacon, which starved task_wdt of its WDI kick and let the external
+       TPS3430 reset the OBC every ~55 s.
+
+       SIZING AT 1200 bps.  This wait is UNCONDITIONAL -- it always burns
+       its full duration, so oversizing it is not free.  What it has to
+       cover is not the whole frame's airtime but only what is still
+       sitting in the FIFO when the refill loop above exits, which is at
+       most one full FIFO: 64 B * 8 / 1200 = 427 ms, regardless of frame
+       length.  (The refill loop itself already spans the rest of the
+       airtime, since it blocks waiting for drain.)
+
+       12 iterations ~= 1.22 s = 2.9x that 427 ms residual.  Going to the
+       ~20 that a naive "scale it with the baud rate" argument suggests
+       would cost 2.04 s per frame; with up to three frames per beacon
+       cycle (beacon + LLM + ACK) that is ~7.1 s of blocking against
+       task_wdt's 9.0 s of late margin, leaving under 2 s.  At 12 the same
+       worst case is ~4.7 s and the kick still lands near 50.7 s, well
+       inside the ~55 s TPS3430 deadline.
+
+       If the console ever shows truncated frames (real data followed by
+       unmodulated carrier, FCS missing), raise this -- but re-check the
+       watchdog margin in the same pass. */
     {
         unsigned int d;
         unsigned int w;
-        for (w = 0; w < 200; w++) {
+        for (w = 0; w < 12; w++) {
             for (d = 0; d < 50000u; d++) { __builtin_nop(); }
             __builtin_clrwdt();
         }

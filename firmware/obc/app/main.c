@@ -14,6 +14,7 @@ $Revision: 3.2 $
 $Date: 2010-03-28 19:40:15-08 $
 
 ******************************************************************************/
+#include "csk_hw.h"       /* SFR definitions (TMR1) for the idle counter */
 #include "events.h"
 #include "init.h"
 #include "main.h"
@@ -39,6 +40,20 @@ $Date: 2010-03-28 19:40:15-08 $
 
 csk_status_t csk_status;
 char strTmp[160];                 // usable to anyone who wants it ...
+
+/* Debug-console verbosity; see CONSOLE_VERBOSE_DEFAULT in main.h.
+   Read by task_beacon (telemetry lines) and task_si4463 (AX.25 hex dump),
+   toggled from the console by the 'q' command. */
+volatile unsigned char g_console_verbose = CONSOLE_VERBOSE_DEFAULT;
+
+/* Timer1 counts (Fcy/256 = 15625 Hz) accumulated while the core was halted in
+   Idle.  Divided by elapsed Salvo ticks this is the CPU idle fraction -- the
+   only on-board measurement of what POWER_IDLE actually buys, on a board with
+   no current sensing.  Reported and re-zeroed by the 'w' console command. */
+volatile unsigned long g_idle_counts = 0;
+
+/* Salvo tick at which the current idle-measurement window opened. */
+volatile unsigned long g_idle_mark_ticks = 0;
 
 
 /******************************************************************************
@@ -89,6 +104,30 @@ int main() {
   // Multitask.
   while (1) {
     OSSched();
+
+#if POWER_IDLE
+    // Halt the core until the next interrupt (PWRSAV #1 = Idle mode).
+    //  Timer2 was opened T2_IDLE_CON so the 100 Hz Salvo tick keeps running
+    //  and always wakes us within 10 ms; UART RX/TX interrupts wake us
+    //  immediately, so console responsiveness is unchanged.
+    //
+    //  Note this idles after EVERY pass, not only the ones where no task was
+    //  eligible, so a dispatch can be followed by up to one tick of sleep
+    //  before the next task runs. With six tasks that is ~50 ms of added skew
+    //  in the worst case -- immaterial against task periods of 0.5 s and up,
+    //  and against the ~9 s of late margin task_wdt has on the TPS3430.
+    //  Doing it properly via OSIdlingHook() would mean adding
+    //  Salvo/Src/MCC30/salvohook_idle.c to the build, which the MPLAB makefile
+    //  generator cannot do headless; this needs no build-system change.
+    {
+      unsigned int t1_before = TMR1;
+      __builtin_pwrsav(1);
+      // Unsigned 16-bit subtraction, so a TMR1 wrap during the span is
+      //  handled correctly. The span is at most one 10 ms tick (~156 counts)
+      //  against a ~4.19 s wrap period, so it can never alias.
+      g_idle_counts += (unsigned long)(unsigned int)(TMR1 - t1_before);
+    }
+#endif
   } /* while */
   
 } /* main() */

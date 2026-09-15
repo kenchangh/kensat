@@ -6,7 +6,7 @@
 
 KENSAT is a 2U CubeSat whose primary mission is to demonstrate **edge-AI compute in orbit**: running large-language-model inference on a power-gated NVIDIA Jetson Orin Nano payload and downlinking the results. The objective is to operate a GPU-class accelerator and a quantized LLM within the power, thermal, and reliability envelope of a small satellite — scheduling the Jetson as a fault-tolerant load, running an inference inside a bounded energy budget, and getting its output to the ground over an open UHF link. The satellite operates in a 520 km sun-synchronous orbit (97.5° inclination, ~95 min period, 0 eccentricity). The program is operated under Swordholder Technologies Inc. (Delaware corporation).
 
-The satellite uses UHF-only communications at 437.08 MHz (100 kbps, 2 kHz bandwidth) for beaconing, telemetry downlink, and command uplink. Telemetry — including downlinked inference results — is unencrypted so amateur operators can receive it; the station operates under an FCC amateur radio license (Technician class).
+The satellite uses UHF-only communications at 437.08 MHz for beaconing, telemetry downlink, and command uplink. The link as flown is **GFSK 1200 bps, AX.25 UI with NRZI + G3RUH scrambling** — chosen so that any amateur station with a 70 cm receiver and a G3RUH-capable TNC (Direwolf, gr-satellites, SatNOGS) decodes it with no custom software. (Parts of this document predate that decision and still describe the original 100 kbps sizing; §6.2 is marked where it reflects the implementation.) Telemetry — including downlinked inference results — is unencrypted so amateur operators can receive it; the station operates under an FCC amateur radio license (Technician class).
 
 ## 2. Physical Stack
 
@@ -39,7 +39,7 @@ A tape measure dipole antenna is used for UHF at 437.08 MHz. The antenna element
 | Burn duration | ~10 s, both pins driven HIGH simultaneously |
 | Polarization | Linear |
 
-Deployment is gated by the `DEVELOPMENT` build flag in [main.h](../firmware/obc/app/main.h) (aliased to `BENCH_TEST`): `DEVELOPMENT=1` (default for bench work) skips the burn and the RF-silence hold, beaconing immediately; `DEVELOPMENT=0` is the flight build that runs the full sequence in [§2.2](#22-boot--deployment-sequence). The current setting is printed to the debug console at boot.
+Deployment is gated by two independent build flags in [main.h](../firmware/obc/app/main.h): `FLIGHT_MODE` (is this build going to space?) and `DEPLOY_ARMED` (a separate debug disarm, which must be `1` for flight). With either at `0` the burn-wire block is compiled out entirely rather than skipped at run time, so the nichrome can never be energised. The RF-silence hold and the beacon itself are **not** gated on either flag — they run identically on the bench, so the bench exercises the exact timing that flies. Both settings are printed to the debug console at boot; see [BUILD.md](../firmware/obc/BUILD.md) for the full flag table.
 
 **RF path:** Si4463 TX/RX pin → matching network on radio board → U.FL connector → U.FL coax cable → antenna feed point on chassis top panel.
 
@@ -60,17 +60,17 @@ A reflash of the `.hex` resets the reserved pages to blank, so a freshly program
 
 **Per-boot flow:**
 
-1. **`init()`** — increment the persistent boot counter, configure peripherals (clocks, I/O directions, UARTs, SPI), and print the boot banner (firmware version, `DEVELOPMENT`/`BENCH_TEST` setting, boot count) to the debug console.
-2. **Salvo scheduler starts.** The beacon task delays ~5 s, initialises the Si4463 into a TX-ready state, then enters its main loop (~30 s cadence). `uptime` below means seconds since *this* power-on — it resets to 0 on every boot.
+1. **`init()`** — increment the persistent boot counter, configure peripherals (clocks, I/O directions, UARTs, SPI), and print the boot banner (firmware version, `FLIGHT_MODE`/`DEPLOY_ARMED` setting, boot count, reset cause) to the debug console.
+2. **Salvo scheduler starts.** The beacon task delays ~5 s, initialises the Si4463 into a TX-ready state, then enters its main loop (~10 s cadence). `uptime` below means seconds since *this* power-on — it resets to 0 on every boot.
 3. **Each loop pass:**
    - Collect telemetry (uptime, EPS rails, attitude/tumble).
-   - **RF-silence gate** (flight only; bench always transmits):
+   - **TX gate** — a commanded `BCN OFF` inhibit (persisted in flash) blocks every transmit path outright; otherwise the RF-silence hold applies, in both bench and flight builds:
      - if `rf_unlocked` is already set → transmit;
-     - else if `uptime ≥ 125 s` → persist `rf_unlocked`, then transmit;
+     - else if `uptime ≥ FLIGHT_HOLD_S` (125 s) → persist `rf_unlocked`, then transmit;
      - else → stay silent (console logs `RF silent (uptime …)`).
-   - **Transmit** the AX.25 beacon (and any queued Jetson inference frame) if allowed. TX counters advance only on a real transmission.
+   - **Transmit** the AX.25 beacon, then any queued Jetson inference frame, then one chunk of a result still being downlinked. TX counters advance only on a real transmission.
    - **Deployment** (flight only, one-shot per boot) fires when *all* hold: `deployed == 0` **and** `attempts < 3` **and** `uptime ≥ 120 s`. It then: bump `attempts` in flash → drive IO.24/IO.25 HIGH for 10 s → drive LOW → set `deployed`. The attempt is recorded *before* the wires energise, so a reset mid-burn still counts toward the 3-try cap. Deployment is GPIO, not RF, so it proceeds normally even during the RF-silence hold.
-   - Delay ~30 s to the next beacon.
+   - **Listen** for the rest of the cycle: arm RX, then poll every 400 ms for ~10 s, handling any uplink telecommand that arrives (including prompt chunks).
 
 **Key behaviours and edge cases:**
 
@@ -229,8 +229,8 @@ This is the primary operating mode. The PIC24 runs continuously.
 
 - EPS charges batteries from solar panels via 4× MPPT channels
 - PIC24 polls EPS telemetry over I²C every 30 seconds
-- PIC24 transmits beacon packets via Si4463 (call sign, battery voltage, temperatures, uptime)
-- PIC24 listens for ground station uplink commands
+- PIC24 transmits beacon packets via Si4463 (call sign, cumulative sequence number, boot count, reset cause, uptime, body rates)
+- PIC24 listens for ground-station telecommands in the gap between beacons (~400 ms poll)
 - PIC24 sends I²C heartbeat to EPS every 60 seconds (see Section 7.1)
 - Jetson is powered off — IO.16 held LOW
 - Estimated power: ~0.5 W (PIC24 + Si4463 idle/beacon)
@@ -252,7 +252,7 @@ Prompts are stored on the Jetson's eMMC before launch:
 └── 19.txt    (up to 20 prompts)
 ```
 
-The PIC24 never touches prompt content — it only sends a 1-byte prompt ID to the Jetson.
+The PIC24 normally never touches prompt content — it sends a prompt ID and the Jetson reads the corresponding file. The one exception is a prompt uplinked from the ground, which the OBC holds in RAM and forwards verbatim (see *Uplink Telecommands* below).
 
 #### Scheduling
 
@@ -274,27 +274,53 @@ That's it. The satellite wakes the Jetson once per day, runs the next prompt in 
 
 After 20 days the prompts cycle back to `00.txt` and repeat. The ground station receives a fresh inference response every day without any uplink.
 
-#### Uplink Override (optional)
+#### Uplink Telecommands (as implemented)
 
-If the ground station wants to run a specific prompt, it sends a short command during a pass:
+The uplink is the same Si4463 at 437.08 MHz, half-duplex: the OBC transmits at
+the top of each ~10 s beacon cycle and spends the rest of the cycle parked in
+RX, polling every 400 ms. "Having an uplink" on a single-radio spacecraft is
+exactly that — spending the inter-beacon gap listening instead of idle.
 
-**Uplink packet (8 bytes total):**
+Uplink frames use the Si4463's own packet handler (preamble + sync `0x2DD4` +
+1-byte length + payload + CRC-16 CCITT) rather than AX.25: descrambling and
+running HDLC over a raw bit stream in software is something the chip's packet
+handler cannot do for us, and the uplink does not need to be decodable by
+third parties the way the downlink does. Payload is capped at 63 bytes, ASCII:
 
-| Field | Size | Description |
-|-------|------|-------------|
-| Sync + preamble | 4 bytes | Si4463 hardware |
-| Command ID | 1 byte | `0x01` = set next prompt |
-| Prompt ID | 1 byte | `0x00`–`0x13` (prompt 0–19) |
-| CRC-16 | 2 bytes | Error check |
+```
+KO6IKZ <AUTH> <VERB>[ <ARG>]
+```
 
-**PIC24 processing:**
+The leading callsign keeps the spacecraft from acting on other traffic; the
+token after it is a shared telecommand code (FCC Part 97.211(b) permits codes
+that obscure the meaning of telecommand messages). A CRC-16 alone is not a
+gate on a command that can silence the spacecraft.
 
-1. Si4463 fires nIRQ (IO.31) → PIC24 services INT2 ISR
-2. PIC24 reads RX FIFO over SPI1, validates CRC-16
-3. Overwrites `next_prompt_id` with the received value
-4. Beacons ACK with the prompt ID echoed back
+| Verb | Effect |
+|------|--------|
+| `BCN OFF` | Inhibit the transmitter. Persisted in program flash, no auto-expiry, gates **every** transmit path including acknowledgements — so there is no reply; the confirmation is that the carrier stops. |
+| `BCN ON` | Resume beaconing. Acknowledged. |
+| `PING` | Liveness check. Acknowledged. |
+| `PR <k>/<m> <text>` | Chunk *k* of *m* of an uplinked LLM prompt. Acknowledged with a bitmap of the chunks held. |
+| `PR?` / `PRX` | Report / discard the prompt being assembled. |
+| `RUN` | Run an inference now — on the assembled uplinked prompt if complete, else the next library prompt. |
+| `RUN <id>` | Run library prompt `<id>` (0–19) now. |
 
-The override only changes which prompt runs next — it does not trigger an immediate inference. The daily timer handles the rest. This keeps the logic simple: one code path for inference, regardless of how the prompt was selected.
+**Prompt uplink.** 63 bytes of payload minus the 15-byte command prefix leaves
+48, so a prompt arrives as up to 6 chunks of ≤ 40 characters (240 total),
+reassembled on the OBC. Chunks may arrive in any order and in any number of
+repeats; each is acknowledged with the bitmap of what is held, so the ground
+re-sends only what was lost rather than starting over. The assembly lives in
+RAM only — a reset drops it and the spacecraft falls back to its own prompt
+library, which is the whole reason the library is on board.
+
+**Commanded RF silence.** `BCN OFF` is the one piece of comms state kept in
+program flash rather than on the SD card: the card is removable, socketed, and
+a plausible single-point failure, and a commanded shutdown that evaporated
+because a card went missing would start the spacecraft transmitting again on
+its own — exactly what the licensing requirement exists to prevent. The
+beacon/TX/RX counters go the other way, to the card, because they change every
+beacon and program flash (~10 k erase cycles) could not survive that rate.
 
 #### Inference Execution
 
@@ -314,9 +340,23 @@ The Jetson daemon reads `/opt/kensat/prompts/05.txt`, loads TinyLlama (Q4_K_M qu
 
 ```
 Jetson → PIC24:  DONE:<length>\n<response_bytes>
+Jetson → PIC24:  TELEM:<cpu>,<gpu>,<cpu_pk>,<gpu_pk>,<mw>,<ram>,<infer_s>,<load_s>\n
 PIC24  → Jetson: OK\n
 PIC24  → Jetson: OFF\n
 ```
+
+For a prompt uplinked from the ground the OBC substitutes one line and
+nothing else changes:
+
+```
+PIC24  → Jetson: PROMPT:<text>\n     (≤ 240 chars, one line, printable ASCII)
+```
+
+The daemon answers identically — `DONE:` + text + `TELEM:` — so there is a
+single code path downstream of the handshake regardless of where the prompt
+came from. Results from an uplinked prompt are reported with prompt ID 99 so
+they can never be confused with library prompt 0, and the library cursor does
+not advance.
 
 Inference timeout: 120 seconds. If exceeded, PIC24 hard-cuts IO.16 LOW.
 
@@ -328,36 +368,54 @@ PIC24 writes response to SD card, updates `last_inference_time` to `rtc_now`, in
 
 **Total Jetson on-time:** ~45–90 seconds.
 
-#### Downlink — 1-Hour Retransmission
+#### Downlink of the Result (as implemented)
 
-After inference, PIC24 retransmits the result for 1 hour:
+The link settled at **1200 bps AX.25 / G3RUH**, not the 100 kbps of the
+original sizing, because that is what amateur stations and SatNOGS can
+actually decode with no custom software. That changes the downlink of an
+inference result from "send the whole thing in 120 ms and repeat it 360
+times" into a fragmentation problem: airtime now costs ~6.7 ms per byte, and
+one AX.25 info field holds 180 bytes against a result of up to 512.
 
-**Downlink packet:**
-
-| Field | Size | Description |
-|-------|------|-------------|
-| Sync + preamble | 4 bytes | Si4463 hardware |
-| Packet type | 1 byte | `0x10` = inference result |
-| Prompt ID | 1 byte | Which prompt was run |
-| Payload length | 2 bytes | Response length in bytes |
-| Payload | N bytes | Response text (≤ 1.5 KB typical) |
-| CRC-16 | 2 bytes | Error check |
-
-At 100 kbps, a 1.5 KB response takes ~120 ms to transmit. No fragmentation — the Si4463 FIFO is refilled by the PIC24 via nIRQ as it drains.
+So the result goes out as numbered chunks, in the same ASCII AX.25 UI frames
+as everything else:
 
 ```
-retransmit_until = rtc_now + 3600
-
-while rtc_now < retransmit_until:
-    transmit inference result     (~120 ms)
-    wait 5 seconds
-    transmit beacon               (~10 ms)
-    wait 5 seconds
+LLM seq=7 pid=99 up=412m cpu=47 gpu=45 pk=61/58 mw=6820 ram=3104 \
+    ml=0s inf=14s lat=14000ms st=03 h=1C2A9F40 txt=300B/3
+TXT s=7 c=1/3 h=1C2A9F40 Earth from orbit is a thin blue line above a bla...
+TXT s=7 c=2/3 h=1C2A9F40 ...
+TXT s=7 c=3/3 h=1C2A9F40 ...
 ```
 
-~360 retransmissions per hour. Ground station needs one clean copy. No sequence numbers, no reassembly.
+| Field | Meaning |
+|-------|---------|
+| `s=` | Result sequence number, shared with the `LLM` housekeeping frame |
+| `c=<k>/<m>` | Chunk *k* of *m* |
+| `h=` | CRC-32 (IEEE, i.e. Python's `zlib.crc32`) of the **complete** result text, computed on board over exactly the bytes transmitted |
+| `txt=<bytes>/<frames>` | On the `LLM` frame: what a complete result looks like, so a station that heard only that frame knows what it is missing |
 
-**Power cost:** ~0.5–1 Wh over the full hour.
+**Cadence: one chunk per beacon cycle, and the whole set twice.** A 144-byte
+chunk encodes to ~218 bytes ≈ 1.5 s of airtime. Sending a 4-chunk result
+back-to-back would consume 6 s of a 10 s cycle — past 60 % transmitter duty
+cycle, with almost no listening window left. Interleaving one chunk per cycle
+holds per-cycle airtime at beacon + one chunk (~2.1 s in 10 s), keeps the
+uplink alive throughout, and spreads the result over ~40 s of sky so a single
+fade cannot take out the whole thing. The repeat pass covers the chunk that a
+fade did take out, and the station that acquired the satellite mid-pass.
+
+**No ARQ, by design.** There is no request-for-repeat and no acknowledgement
+from the ground, so `s=`, `c=` and `h=` are the entire reassembly protocol:
+group by `s=`, order by `c=`, concatenate, verify `h=`. The CRC-32 is the only
+end-to-end integrity check the text has — a frame that passes the AX.25 FCS
+can still be the wrong chunk of the wrong result.
+[ground-station/llm_downlink.py](../ground-station/llm_downlink.py) implements
+the ground half and reports exactly which chunks are missing.
+
+**Power cost:** ~80 s of result downlink per inference (4 chunks × 2 passes at
+one per cycle), against a beacon that is transmitting anyway — a few tens of
+mWh, versus ~1 Wh for the hour-long retransmission the 100 kbps design
+assumed.
 
 #### State Machine
 
@@ -369,10 +427,10 @@ while rtc_now < retransmit_until:
                     │                         │
           ┌────────┴────────┐                 │
           │                 │                 │
-    (uplink received)  (24h elapsed?)         │
+    (uplink RUN / PR)  (24h elapsed?)         │
           │                 │                 │
-   set next_prompt_id  (vbatt ≥ 7.0V?)       │
-   beacon ACK               │                │
+   queue the prompt    (vbatt ≥ 7.0V?)       │
+   ACK downlink             │                │
    stay in IDLE         NO: wait             │
                         YES: ──→ JETSON_BOOT  │
                                     │         │
@@ -391,8 +449,8 @@ while rtc_now < retransmit_until:
                             │    │     update prompt_id
                             │    │     write to flash
                             │    │            │
-                            │    │     DOWNLINK_LOOP
-                            │    │      (1 hour)
+                            │    │     DOWNLINK (TXT chunks,
+                            │    │      1 per beacon cycle)
                             │    │            │
                             └────┴────────────┘
 ```

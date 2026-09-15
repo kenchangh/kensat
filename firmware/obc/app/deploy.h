@@ -36,12 +36,18 @@ unsigned int deploy_attempt_inc(void);
    count).  Call only AFTER the burn fully completes.  Blocks a few ms. */
 void deploy_set(void);
 
-/* Return 1 if the initial 125 s RF-silence compliance hold has already been
-   satisfied once (so later reboots may transmit immediately), else 0. */
+/* Return 1 if the initial FLIGHT_HOLD_S RF-silence compliance hold has already
+   been satisfied once (so later reboots may transmit immediately), else 0. */
 unsigned int deploy_rf_unlocked_get(void);
 
 /* Persist the rf_unlocked flag (idempotent -- only writes flash the first
-   time).  Call once the initial 125 s hold has elapsed. */
+   time).  Call once the initial FLIGHT_HOLD_S hold has elapsed.
+
+   NOTE: that hold applies to bench builds too (it is not gated on
+   FLIGHT_MODE), so an ordinary bench session long enough to clear it will
+   latch this flag.  A board flown in that state transmits from its first
+   orbital loop with no wait -- clear the page with deploy_reset() (console
+   'y') as the last step before flight, or reflash, then confirm with 'd'. */
 void deploy_rf_unlock(void);
 
 /* Clear all persisted deployment state -- deployed flag, attempt count and

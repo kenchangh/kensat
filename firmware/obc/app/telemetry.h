@@ -30,12 +30,6 @@ frame_type byte whenever the layout changes so the groundstation can parse.
 /* Callsign length (no null terminator in frame) */
 #define TLM_CALLSIGN_LEN    6
 
-/* EPS rail status bit flags */
-#define TLM_RAIL_3V3        0x01
-#define TLM_RAIL_5V         0x02
-#define TLM_RAIL_VBATT      0x04
-#define TLM_RAIL_JETSON     0x08
-
 /* LLM status flags */
 #define TLM_LLM_MODEL_LOADED   0x01
 #define TLM_LLM_INFERENCE_OK   0x02
@@ -67,11 +61,9 @@ typedef struct __attribute__((packed)) {
     unsigned long  uptime_s;                    /* seconds since boot */
     unsigned char  reboot_count;                /* saturates at 255 */
 
-    /* Power rails (7 B). 0 = unknown / rail down. */
-    unsigned int   vbatt_mv;                    /* battery (SoC proxy), EPS I2C */
-    unsigned int   vcc_5v_mv;                   /* +5V_SYS */
+    /* Power rails (2 B). 0 = unknown / rail down. (No vbatt: this board has
+       no battery-sense hardware.) */
     unsigned int   vcc_3v3_mv;                  /* VCC_SYS (PIC24 VDD) */
-    unsigned char  eps_rails;                   /* TLM_RAIL_* bitflags */
 
     /* Tumbling (8 B). BMI088 gyro, body frame, deg/s. */
     int            gyro_x_dps;
@@ -79,17 +71,15 @@ typedef struct __attribute__((packed)) {
     int            gyro_z_dps;
     unsigned int   tumble_mag_dps;              /* sqrt(x^2 + y^2 + z^2) */
 
-    /* Comms (8 B) */
-    unsigned char  tx_power;                    /* PA_PWR_LVL */
+    /* Comms (5 B) */
     unsigned char  last_rssi;                   /* raw RSSI of last RX */
     unsigned int   tx_count;
     unsigned int   rx_count;
-    unsigned int   crc_err_count;
 
     /* Operational (1 B) */
     unsigned char  mission_mode;                /* TLM_MODE_* */
 } tlm_beacon_t;
-/* Total: 38 bytes */
+/* Total: 34 bytes */
 
 
 /******************************************************************************
@@ -127,7 +117,7 @@ typedef struct __attribute__((packed)) {
     unsigned char  llm_status;                  /* TLM_LLM_* bitflags */
     unsigned long  llm_hash;                    /* hash of response text */
 } tlm_llm_t;
-/* Total: 38 bytes */
+/* Total: 34 bytes */
 
 #endif /* __PIC24FJ256GB210__ */
 

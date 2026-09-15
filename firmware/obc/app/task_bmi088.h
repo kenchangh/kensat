@@ -9,6 +9,10 @@ I2C1 bus and prints raw 16-bit counts to the debug console (CSK UART1).
 
 extern void task_bmi088(void);
 
+/* Read back GYR_LPM1 / ACC_PWR_CONF (0x80 / 0x03 == both suspended).
+   Returns 0 on success. */
+int  bmi088_get_pwr_state(unsigned char *gyr_lpm1, unsigned char *acc_pwr_conf);
+
 /* Latest gyro reading in degrees/second (body frame), plus the magnitude
    of the angular-velocity vector. Updated by task_bmi088 each cycle;
    read by task_beacon for the tumbling fields of the beacon packet.

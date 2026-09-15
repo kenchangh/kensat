@@ -14,9 +14,10 @@ See ax25.h for the high-level pipeline. This file implements:
   5. G3RUH scrambler: out = in XOR sr[12] XOR sr[17] with sr shifting
      in the scrambled output. Self-synchronizing — receiver locks
      within 17 bits once data starts.
-  6. Pack LSB-first into output bytes (bit 0 of byte 0 is the first
-     bit on the air). The final byte is padded out to a byte boundary
-     with additional scrambled flag bits.
+  6. Pack MSB-first into output bytes (bit 7 of byte 0 is the first
+     bit on the air, matching the Si4463's MSB-first FIFO shift-out).
+     The final byte is padded out to a byte boundary with additional
+     scrambled flag bits.
 
 ******************************************************************************/
 #include "ax25.h"
@@ -31,7 +32,7 @@ typedef struct {
     unsigned char *out;
     unsigned int   cap;
     unsigned int   byte_idx;
-    unsigned char  bit_idx;     /* 0..7, LSB-first within byte */
+    unsigned char  bit_idx;     /* 0..7, MSB-first within byte */
     unsigned char  nrzi_last;   /* current NRZI line level (0/1) */
     unsigned long  sr;          /* 17-bit G3RUH scrambler shift reg */
     unsigned char  overflow;

@@ -46,11 +46,32 @@ SatNOGS) can decode it.
 | **Baud** | 1200 |
 | **Framing** | AX.25 UI, NRZI + G3RUH |
 | **Source callsign** | KO6IKZ |
-| **Beacon interval** | ~30 s |
+| **Beacon interval** | ~10 s |
 | **Status** | active |
 | **Encryption** | none — telemetry is open by design |
 
-Decoders and an end-to-end test harness live in
+Everything in the info field is plain ASCII. Frames are identified by their
+first token:
+
+| Frame | Carries |
+|-------|---------|
+| `BCN` | Housekeeping beacon: cumulative sequence number, boot count, reset cause, uptime, body rates, uplink frames received |
+| `LLM` | One per on-orbit inference: Jetson temperatures and peaks, power, RAM, model-load and inference times, result CRC-32, and how many text frames to expect |
+| `TXT` | The text the on-board LLM generated, as numbered chunks — `s=` result, `c=<k>/<m>` chunk, `h=` CRC-32 of the whole result |
+| `ACK` | Acknowledgement of a received telecommand |
+
+A result is sent one chunk per beacon cycle and the whole set twice, because
+the link has no ARQ. To reassemble: group by `s=`, order by `c=`, concatenate,
+and check `h=` (standard CRC-32). `ground-station/llm_downlink.py` does this
+for you, from live decoder output or a saved log.
+
+Command uplink is a short authenticated ASCII telecommand (Si4463 native
+framing, CRC-16) that can inhibit the transmitter, ping the spacecraft, uplink
+a prompt for the LLM in chunks, and start an inference. Formats, verbs and the
+reasoning behind them are in
+**[firmware/obc/README.md](firmware/obc/README.md#the-radio-link)**.
+
+Decoders, the result reassembler and an end-to-end test harness live in
 **[ground-station](ground-station)**.
 
 ---
@@ -112,6 +133,9 @@ budget, and thermal analysis.
   UART, dispatches a prompt, collects the generated text, powers the Jetson back
   off, and queues the result for downlink. The whole cycle is bounded by a
   measured **per-inference energy budget** so a single run can't drain the pack.
+  Prompts come either from a library pre-loaded on the payload — so the mission
+  produces results with no uplink at all — or from the ground, uplinked in
+  40-character chunks and reassembled on the OBC.
   ([docs/system-architecture.md §6.2](docs/system-architecture.md), [jetson/](jetson))
 
 - **Treating a GPU as a spacecraft load.** Running multi-watt edge compute on a

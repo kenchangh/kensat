@@ -20,6 +20,9 @@ $Date: 2010-02-13 13:17:57-08 $
 #include "task_cmd.h"
 #include "task_onchip_temp.h"
 #include "task_si4463.h"
+#include "task_beacon.h"
+#include "task_sdlog.h"
+#include "task_bmi088.h"
 #include "bootcount.h"
 #include "deploy.h"
 #include "tasks.h"
@@ -49,7 +52,10 @@ Act on single-character commands:
   h|?: help
   i:   toggle Exercise I/O task on/off
   m:   cycle between various MCLK output settings
+  n:   inject a two-chunk uplinked LLM prompt + RUN (bench builds only)
   r:   restart application
+  q:   toggle debug-console verbosity (terse <-> full)
+  w:   power report: CPU idle %, sensor power state, PMD registers
   t:   display on-chip temperature
   v:   display version number
   z:   go to sleep
@@ -60,7 +66,7 @@ Act on single-character commands:
 static
 void cmd_explain(void) {
 
-  user_debug_msg(STR_CMD_EXPLAIN "h|?: Commands: {h|?, b, c, d, g, i, j, k, m, r, s, t, v, x, y, z}");
+  user_debug_msg(STR_CMD_EXPLAIN "h|?: Commands: {h|?, b, c, d, g, i, j, k, l, m, n, p, q, r, s, t, u, v, w, x, y, z}");
 
 } /* cmd_explain() */
 
@@ -75,12 +81,16 @@ void task_cmd_do(void) {
   
   csk_status.MCLKOutEnabled = 0;
   
-  // Intro messages. Buffer is pretty small, so wait a bit to flush it.
-  user_debug_msg(STR_TASK_CMD_DO "Control via RS-232 I/F at " STR_BAUD_RATE ",N,8,1.");
-  OS_Delay(50);
-
-  user_debug_msg(STR_TASK_CMD_DO "Microhard MHX modem at " STR_BAUD_RATE ",N,8,1.");
-  OS_Delay(50);
+  // Startup status: persistent boot count (program flash) + a fresh VCC_SYS
+  // (3V3) read (the beacon cycle hasn't populated g_rail_3v3_mv yet).
+  // No battery SoC: this board has no battery-sense hardware.
+  {
+    unsigned int v3 = beacon_read_3v3();
+    sprintf(strTmp, STR_TASK_CMD_DO "Boot count = %u, 3V3 = %u mV.",
+            bootcount_get(), v3);
+    user_debug_msg(strTmp);
+    OS_Delay(50);
+  }
 
   cmd_explain();
 
@@ -113,45 +123,30 @@ void task_cmd_do(void) {
           break;
 
 
-        // 'd': normally shows persistent antenna deployment state (program
-        // flash).  With DEPLOY_TEST=1 (main.h) it instead FIRES the burn-wire
-        // deployment sequence immediately -- bench testing only.
+        // Dump SD card log files to the console (read the card without
+        // pulling it). sd_dump_file() doesn't yield, so the WHOLE dump is one
+        // uninterruptible stretch -- and at 9600 baud a few KB of TELEM.CSV
+        // easily outruns the ~9 s of late margin task_wdt has before the
+        // TPS3430 resets the OBC. Bench-only command, but that is why the two
+        // tiny counter files are dumped FIRST: they are the ones you usually
+        // want, and they are guaranteed to make it out before the big logs
+        // blow the deadline.
+        case 'l':
+          user_debug_msg(STR_TASK_CMD_DO "l: Dumping SD files...");
+          sd_dump_file("COMMS0.DAT");
+          sd_dump_file("COMMS1.DAT");
+          sd_dump_file("BOOT.LOG");
+          sd_dump_file("TELEM.CSV");
+          sd_dump_file("INFER.LOG");
+          break;
+
+
+        // 'd': shows persistent antenna deployment state (program flash).
         case 'd':
-#if DEPLOY_TEST
-          if (deploy_get()) {
-            user_debug_msg(STR_TASK_CMD_DO "d: already deployed -- press 'y' to clear first.");
-          }
-          else if (deploy_attempts_get() >= DEPLOY_MAX_ATTEMPTS) {
-            user_debug_msg(STR_TASK_CMD_DO "d: attempt limit reached -- press 'y' to clear.");
-          }
-          else {
-            unsigned int n = deploy_attempt_inc();   /* persist before burn */
-            sprintf(strTmp,
-                    STR_TASK_CMD_DO "d: deploy attempt %u/%u: nichrome IO.24+IO.25 HIGH.",
-                    n, DEPLOY_MAX_ATTEMPTS);
-            user_debug_msg(strTmp);
-
-            /* Drive burn wires HIGH on IO.24 (RF1) and IO.25 (RF0). */
-            _TRISF1 = 0;
-            _TRISF0 = 0;
-            csk_io24_high();
-            csk_io25_high();
-
-            /* Burn duration: 10 s = 5 x OS_Delay(200), at the task top level. */
-            OS_Delay(200); OS_Delay(200); OS_Delay(200); OS_Delay(200); OS_Delay(200);
-
-            csk_io24_low();
-            csk_io25_low();
-
-            deploy_set();   /* burn completed -- record DEPLOYED */
-            user_debug_msg(STR_TASK_CMD_DO "d: nichrome OFF, antenna deployed (flag set).");
-          }
-#else
           sprintf(strTmp,
                   STR_TASK_CMD_DO "d: deployed = %u, attempts = %u, rf_unlocked = %u.",
                   deploy_get(), deploy_attempts_get(), deploy_rf_unlocked_get());
           user_debug_msg(strTmp);
-#endif
           break;
 
 
@@ -204,6 +199,42 @@ void task_cmd_do(void) {
           break;
 
 
+#if DEVELOPMENT
+        // Bench only: fake an uplink telecommand, toggling the beacon
+        //  inhibit through the real command dispatcher.  Compiled out for
+        //  flight (DEVELOPMENT=0) so the phantom-command bug in this task
+        //  -- stale SEM_CMD_CHAR_P counts after a long UART1 response, see
+        //  "Known issues" in firmware/obc/README.md -- can never silence the
+        //  transmitter on orbit.
+        case 'u':
+          if (beacon_inhibited())
+            beacon_uplink_inject("KO6IKZ KENSAT1 BCN ON");
+          else
+            beacon_uplink_inject("KO6IKZ KENSAT1 BCN OFF");
+          break;
+
+
+        // Bench only: fake a PING telecommand (expects an ACK downlink).
+        case 'p':
+          beacon_uplink_inject("KO6IKZ KENSAT1 PING");
+          break;
+
+
+        // Bench only: fake an uplinked LLM prompt -- two chunks plus RUN,
+        //  pushed through the real uplink dispatcher.  Exercises the whole
+        //  chain with no ground transmitter: chunk reassembly, the ACK
+        //  bitmaps, the handoff to task_jetson, "PROMPT:<text>" on the
+        //  payload UART, and then the TXT text downlink of whatever the
+        //  model generates.  Watch for "prompt chunk stored" then
+        //  "COMPLETE, awaiting RUN".
+        case 'n':
+          beacon_uplink_inject("KO6IKZ KENSAT1 PR 1/2 Describe the Earth ");
+          beacon_uplink_inject("KO6IKZ KENSAT1 PR 2/2 from orbit in one line.");
+          beacon_uplink_inject("KO6IKZ KENSAT1 RUN");
+          break;
+#endif
+
+
         // Si4463 radio: init and set RX mode.
         case 's':
           user_debug_msg(STR_TASK_CMD_DO "s: Si4463 init + RX mode...");
@@ -216,6 +247,72 @@ void task_cmd_do(void) {
           sprintf(strTmp, STR_TASK_CMD_DO "t: Uncalibrated on-chip temperature is %dC.", onchip_temp_deg_c());
           user_debug_msg(strTmp);
           break;
+
+
+        // Toggle debug-console verbosity.  Terse (the default) is one line per
+        //  beacon; verbose adds the rails/tumble lines and the AX.25 hex dump
+        //  of every frame -- ~500 extra chars per cycle, which at 9600 baud is
+        //  ~0.5 s of busy-waited UART in which the CPU cannot idle.
+        case 'q':
+          g_console_verbose = !g_console_verbose;
+          sprintf(strTmp, STR_TASK_CMD_DO "q: console %s.",
+                  g_console_verbose
+                    ? "VERBOSE (telemetry lines + AX.25 hex dump)"
+                    : "terse (one line per beacon)");
+          user_debug_msg(strTmp);
+          break;
+
+
+        // Power report.  Three things, none of which the board can sense
+        //  electrically (there is no current-sense hardware anywhere on it):
+        //   1. CPU idle fraction -- what POWER_IDLE actually buys, measured.
+        //   2. BMI088 power-mode readback -- proves the sensors really are
+        //      suspended between samples rather than the writes silently
+        //      failing, which would look identical from the readings.
+        //   3. PMD registers -- proves the module-disable bits stuck.
+        //  The idle window is re-zeroed on every call, so two 'w's separated
+        //  by an interval measure that interval. Compare terse vs verbose
+        //  ('q') to see what console traffic costs in idle time.
+        case 'w': {
+          unsigned long now    = OSGetTicks();
+          unsigned long counts = g_idle_counts;
+          unsigned long span   = now - g_idle_mark_ticks;
+          unsigned char lpm1 = 0, pwrconf = 0;
+
+          g_idle_counts     = 0;
+          g_idle_mark_ticks = now;
+
+          if (span == 0) span = 1;
+          /* Timer1 runs at Fcy/256 = 15625 Hz, so a fully-idle 10 ms tick is
+             156.25 counts and a fully-idle window is span * 156.25.  Hence
+             1000 * counts / (span * 156.25) == counts * 64 / (span * 10),
+             which is tenths of a percent -- no float, and the intermediate
+             stays inside 32 bits for windows of several hours. */
+          {
+            unsigned long permille = (counts * 64UL) / (span * 10UL);
+            sprintf(strTmp, STR_TASK_CMD_DO
+                    "w: CPU idle %lu.%lu%% over %lu.%lus",
+                    permille / 10UL, permille % 10UL,
+                    span / 100UL, (span / 10UL) % 10UL);
+          }
+          user_debug_msg(strTmp);
+
+          if (bmi088_get_pwr_state(&lpm1, &pwrconf) == 0) {
+            sprintf(strTmp, STR_TASK_CMD_DO
+                    "w: BMI088 GYR_LPM1=%02X (%s) ACC_PWR_CONF=%02X (%s)",
+                    lpm1,    (lpm1    == 0x80) ? "suspend" : "AWAKE",
+                    pwrconf, (pwrconf == 0x03) ? "suspend" : "AWAKE");
+          } else {
+            sprintf(strTmp, STR_TASK_CMD_DO "w: BMI088 power readback FAILED");
+          }
+          user_debug_msg(strTmp);
+
+          sprintf(strTmp, STR_TASK_CMD_DO
+                  "w: PMD1=%04X PMD2=%04X PMD3=%04X PMD4=%04X PMD5=%04X PMD6=%04X",
+                  PMD1, PMD2, PMD3, PMD4, PMD5, PMD6);
+          user_debug_msg(strTmp);
+          break;
+        }
 
 
         // Tell version.

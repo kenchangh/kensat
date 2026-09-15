@@ -3,7 +3,8 @@
 #
 # Runs on boot via systemd. Immediately starts llama-server to pre-load
 # the model, then sends READY over UART once the server is healthy.
-# Waits for RUN:XX from the PIC24, runs inference via HTTP, returns the
+# Waits for RUN:XX (a library prompt) or PROMPT:<text> (a prompt uplinked
+# from the ground) from the PIC24, runs inference via HTTP, returns the
 # result over UART, then shuts down on OFF command.
 #
 # The Jetson boots because the PIC24 drives IO.16 HIGH (hardware power
@@ -237,7 +238,18 @@ start_heartbeat
 uart_send "READY"
 echo "[kensat] Sent READY, waiting for RUN command..." >&2
 
-# ---- Step 3: Wait for RUN:XX ----
+# ---- Step 3: Wait for the prompt command ----
+#
+# Two forms, both answered identically (DONE:<len> + text + TELEM:...):
+#
+#   RUN:XX            run prompt XX (00-19) from the pre-loaded library
+#   PROMPT:<text>     run this free-text prompt, uplinked from the ground
+#                     and forwarded verbatim by the OBC
+#
+# The OBC caps an uplinked prompt at 240 chars (JETSON_PROMPT_MAX in
+# firmware/obc/app/task_jetson.h) and reduces it to printable ASCII on one
+# line, so the bound below is a belt-and-braces check on a serial line, not
+# the primary limit.
 line=$(uart_readline 120) || {
     echo "[kensat] Timeout waiting for RUN command, exiting." >&2
     exit 1
@@ -245,22 +257,41 @@ line=$(uart_readline 120) || {
 
 line="${line%%$'\r'}"
 
-if [[ ! "$line" =~ ^RUN:([0-9]{2})$ ]]; then
+PROMPT_MAX_CHARS=240
+
+if [[ "$line" =~ ^RUN:([0-9]{2})$ ]]; then
+    prompt_id="${BASH_REMATCH[1]}"
+    prompt_file="$PROMPT_DIR/${prompt_id}.txt"
+    echo "[kensat] Running library prompt $prompt_id from $prompt_file" >&2
+
+    if [[ ! -f "$prompt_file" ]]; then
+        echo "[kensat] Prompt file not found: $prompt_file" >&2
+        uart_send "ERR:NO_PROMPT"
+        exit 1
+    fi
+
+    prompt_text=$(cat "$prompt_file")
+
+elif [[ "$line" == PROMPT:* ]]; then
+    prompt_id="UP"
+    prompt_text="${line#PROMPT:}"
+
+    if [[ -z "$prompt_text" ]]; then
+        echo "[kensat] Empty uplinked prompt." >&2
+        uart_send "ERR:EMPTY_PROMPT"
+        exit 1
+    fi
+    if (( ${#prompt_text} > PROMPT_MAX_CHARS )); then
+        echo "[kensat] Uplinked prompt too long (${#prompt_text} chars), truncating." >&2
+        prompt_text="${prompt_text:0:PROMPT_MAX_CHARS}"
+    fi
+
+    echo "[kensat] Running uplinked prompt (${#prompt_text} chars): $prompt_text" >&2
+
+else
     echo "[kensat] Unexpected command: '$line'" >&2
     exit 1
 fi
-
-prompt_id="${BASH_REMATCH[1]}"
-prompt_file="$PROMPT_DIR/${prompt_id}.txt"
-echo "[kensat] Running prompt $prompt_id from $prompt_file" >&2
-
-if [[ ! -f "$prompt_file" ]]; then
-    echo "[kensat] Prompt file not found: $prompt_file" >&2
-    uart_send "ERR:NO_PROMPT"
-    exit 1
-fi
-
-prompt_text=$(cat "$prompt_file")
 
 # ---- Step 4: Run inference (server already loaded) ----
 # Sample baseline temperatures before inference
@@ -307,7 +338,9 @@ reply=$(echo "$response" | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
 # Replace newlines with spaces — PIC24 reads until first \n
-# Truncate to 384 chars — PIC24 RX ring buffer is 512 bytes, need headroom
+# Truncate to 384 chars — PIC24 RX ring buffer is 512 bytes, need headroom.
+# The OBC downlinks whatever arrives here in 144-byte AX.25 "TXT" frames,
+# one per 10 s beacon cycle, so 384 chars is 3 frames per pass over the set.
 text = data["choices"][0]["message"]["content"]
 text = text.replace("\n", " ").replace("\r", "")[:384]
 print(text)
@@ -360,8 +393,13 @@ echo "[kensat] Received: '$line'" >&2
 # ---- Step 7: Shutdown ----
 echo "[kensat] Shutting down..." >&2
 exec 3>&-
-# PIC24 controls power via IO.16 — only shutdown if we got the OFF command
+# PIC24 controls power via IO.16 — only shutdown if we got the OFF command.
+# The `shutdown` call is deliberately left commented out: the OBC cuts the
+# rail 10 s after sending OFF either way, and the rootfs is mounted read-only
+# so a hard cut is safe. The `:` keeps the branch syntactically valid with
+# the call commented out — without it bash fails to parse this block.
 if [[ "${line:-}" == "OFF" ]]; then
+    :
     # echo "${SUDO_PASS:-}" | sudo -S shutdown -h now
 else
     echo "[kensat] No OFF received, exiting without shutdown." >&2
