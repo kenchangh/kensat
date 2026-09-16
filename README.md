@@ -67,7 +67,8 @@ for you, from live decoder output or a saved log.
 
 Command uplink is a short authenticated ASCII telecommand (Si4463 native
 framing, CRC-16) that can inhibit the transmitter, ping the spacecraft, uplink
-a prompt for the LLM in chunks, and start an inference. Formats, verbs and the
+a prompt of up to 256 characters for the LLM in a single frame (which starts
+the inference), or run a library prompt. Formats, verbs and the
 reasoning behind them are in
 **[firmware/obc/README.md](firmware/obc/README.md#the-radio-link)**.
 
@@ -134,8 +135,8 @@ budget, and thermal analysis.
   off, and queues the result for downlink. The whole cycle is bounded by a
   measured **per-inference energy budget** so a single run can't drain the pack.
   Prompts come either from a library pre-loaded on the payload — so the mission
-  produces results with no uplink at all — or from the ground, uplinked in
-  40-character chunks and reassembled on the OBC.
+  produces results with no uplink at all — or from the ground, uplinked as a
+  single 256-byte prompt field that the OBC runs as soon as it arrives.
   ([docs/system-architecture.md §6.2](docs/system-architecture.md), [jetson/](jetson))
 
 - **Treating a GPU as a spacecraft load.** Running multi-watt edge compute on a

@@ -26,6 +26,14 @@ For register-level debugging reference, see `docs/debug-si4463.md`.
 - Length byte: payload length (0-63). Consumed by Si4463 packet handler (Field 1).
 - CRC-16: CCITT polynomial 0x1021, seed 0x0000, big-endian. Covers length + payload.
 
+> **OBC uplink differs.** This section is the bench link that was brought up
+> first. The flight OBC's uplink receiver (`si4463_pkt_cfg_rx()` in
+> `firmware/obc/app/task_si4463.c`) uses a **2-byte big-endian length**
+> (`PKT_LEN = 0x3A`) so a frame can carry the ~280-byte `PROMPT`
+> telecommand, and needs a preamble longer than its 400 ms poll period
+> (768 bytes by default). `pluto_tx.py` builds that frame by default;
+> `--len-bytes 1` gives the format above.
+
 ### Si4463 Config Highlights (task_si4463.c)
 | Register | Value | Notes |
 |----------|-------|-------|

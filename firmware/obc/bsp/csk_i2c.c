@@ -12,7 +12,7 @@ I2C1BRG for 100 kHz: BRG = (Fcy/Fscl) - (Fcy * 130ns) - 1
 #include <p24Fxxxx.h>
 
 /* ~10 ms timeout @ Fcy=4MHz; spin loop body is several cycles, so this
-   is conservative — actual wall time is comfortably under 50 ms. */
+   is conservative; actual wall time is comfortably under 50 ms. */
 #define I2C_SPIN_TIMEOUT  20000UL
 
 #define WAIT_FLAG(cond) do {                              \

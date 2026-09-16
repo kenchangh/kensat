@@ -62,7 +62,7 @@ whole set twice. That is deliberate: back-to-back chunks would push the
 transmitter duty cycle past 60 % and leave no listening window, while
 spreading them over ~40 s of sky and repeating the set means a single fade
 cannot take out a whole result on a link with no ARQ. The reasoning is
-written out above `beacon_tx_llm_text()`.
+in the "LLM result text downlink" comment in `task_beacon.c`.
 
 Reassembly on the ground is three rules — group by `s=`, order by `c=`,
 verify `h=` (standard CRC-32, i.e. Python's `zlib.crc32`) — implemented in
@@ -71,7 +71,8 @@ verify `h=` (standard CRC-32, i.e. Python's `zlib.crc32`) — implemented in
 ### Uplink telecommands
 
 Uplink uses the Si4463's own packet handler (preamble + sync `0x2DD4` +
-length + payload + CRC-16), payload capped at 63 bytes, ASCII:
+2-byte big-endian length + payload + CRC-16 over length and payload), payload
+up to 300 bytes, ASCII:
 
 ```
 KO6IKZ <AUTH> <VERB>[ <ARG>]
@@ -88,16 +89,30 @@ a command that can silence the spacecraft. **Change `UPLINK_AUTH` in
 | `BCN OFF` | Inhibit the transmitter. Persisted in program flash, no auto-expiry, and gates every transmit path including acknowledgements — so there is no reply; the confirmation is that the carrier stops. |
 | `BCN ON` | Resume beaconing. Acknowledged. |
 | `PING` | Liveness check. Acknowledged. |
-| `PR <k>/<m> <text>` | Chunk *k* of *m* of an uplinked LLM prompt (≤ 40 chars per chunk, ≤ 6 chunks = 240 chars). Acknowledged with the bitmap of chunks held, so the ground can re-send only what was lost. Chunks may arrive in any order. |
-| `PR?` | Report prompt-assembly state. Acknowledged. |
-| `PRX` | Discard the partially assembled prompt. Acknowledged. |
-| `RUN` | Run an inference now — on the assembled uplinked prompt if one is complete, otherwise on the next prompt in the Jetson's on-board library. |
+| `PROMPT <field>` | Run an inference **now** on an uplinked LLM prompt. The field is exactly 256 bytes: the prompt in printable ASCII, NUL-padded to the end (no NUL if it is a full 256). Acknowledged as `PROMPT <n>B h=<crc32>`, the length and CRC-32 of the prompt as received. |
+| `RUN` | Run an inference now on the next prompt in the Jetson's on-board library. |
 | `RUN <id>` | Run library prompt `<id>` (0–19) now. |
 
-A `RUN` the payload cannot take (already powered, or a bad index) is
-acknowledged as `NAK`, not dropped: repeating a telecommand is how you get
-one through a fading uplink, and the operator has to be able to tell "heard,
-declined" from "not heard".
+A command the payload cannot take is acknowledged as `NAK`, not dropped:
+repeating a telecommand is how you get one through a fading uplink, and the
+operator has to be able to tell "heard, declined" from "not heard". For
+`PROMPT` the NAK says why: `len=` (field not 256 bytes), `char@` (a
+non-printable byte), `pad@` (non-NUL after the padding starts), `empty`, or
+`busy` (the payload is running something else). A repeat of a `PROMPT` whose
+run is still pending is acknowledged again with `dup` and does not queue a
+second run. Once that run has finished, the same frame would run again, so
+the ground stops sending when it hears the ACK.
+
+**Why one ~280-byte frame works.** The Si4463 RX FIFO is 64 bytes, about
+53 ms at 9600 bps, and the OBC polls the radio every 400 ms. A short command
+fits in the FIFO and waits there for the next poll. A `PROMPT` frame does
+not, so the radio also raises nIRQ on preamble/sync detect, and the poll that
+sees one stays with the frame, draining the FIFO until the packet completes
+(`si4463_rx_poll()`; blocks ≤ ~0.9 s). That only works if the poll sees the
+preamble before the data arrives, so **the ground preamble must be longer
+than the poll period**: `ground-station/pluto_tx.py` sends 768 bytes
+(640 ms). A frame is accepted only if exactly 2 + length bytes came out of
+the FIFO, so an overflow is a reject, never a truncated command.
 
 The uplinked prompt is held in RAM only and never persisted — a reset falls
 back to the on-board prompt library, so the mission keeps producing results
@@ -106,7 +121,7 @@ prompt, so experimenting from the ground never skips part of the planned
 prompt set.
 
 On the bench, `u`, `p` and `n` on the debug console push telecommands through
-the real uplink dispatcher (prompt chunks, `RUN`, inhibit, ping) with no
+the real uplink dispatcher (a full `PROMPT` frame, inhibit, ping) with no
 ground transmitter; only the demodulator is bypassed. They are compiled out
 of flight builds — see **Known issues** below.
 

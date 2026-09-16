@@ -18,58 +18,30 @@ $Date: 2011-09-17 22:12:29-07 $
 #define __main_h
 
 
-/* Flight-configuration gate.  This is THE switch that arms the antenna
-   deployment hardware -- read it as "is this build going to space?".
-
-   FLIGHT_MODE = 0 (FALSE, bench/default) -> the nichrome burn FETs on
-                     IO.24 (RF1) / IO.25 (RF0) are NEVER energised: the deploy
-                     block is compiled out entirely, not merely skipped at
-                     run time.  The safe setting for all bench, vibration and
-                     radio work.
-   FLIGHT_MODE = 1 (TRUE, flight)         -> once uptime passes FLIGHT_HOLD_S
-                     the burn wires fire once, subject to the persistent
-                     DEPLOYED flag and the 3-attempt cap in deploy.h.
-
-   NOT gated on FLIGHT_MODE: the RF-silence hold and the beacon itself.  The
-   beacon task starts ~5 s after boot and transmits from FLIGHT_HOLD_S onwards
-   in BOTH builds, regardless of whether deployment happened, succeeded, or
-   was compiled out -- a faint pre-deploy signal is still a signal, and there
-   is no deployment sense line to condition it on anyway. */
+/* Flight build switch; arms antenna deployment.
+   0 = bench: deploy code (nichrome FETs on IO.24/RF1, IO.25/RF0) is compiled
+       out.  Use for all bench, vibration and radio work.
+   1 = flight: burn wires fire once uptime passes FLIGHT_HOLD_S, subject to
+       the DEPLOYED flag and 3-attempt cap in deploy.h.
+   The RF-silence hold and the beacon run in both builds. */
 #define FLIGHT_MODE           1
 
-/* ===================== TEMPORARY DEBUG DISARM =====================
-   Added 2026-08-23 while chasing the FLIGHT_MODE boot loop.
-
-   DEPLOY_ARMED = 0 -> the burn-wire block in task_beacon.c is compiled out
-                       EVEN IN A FLIGHT_MODE BUILD.  Everything else about
-                       FLIGHT_MODE stays live (RF hold, timings, the
-                       flight-only console gating), so the boot loop can be
-                       reproduced and debugged with zero chance of tripping
-                       the nichrome.
-   DEPLOY_ARMED = 1 -> normal: FLIGHT_MODE alone decides.
-
-   >>> THIS MUST BE 1 FOR FLIGHT. <<<  It is deliberately a separate switch
-   from FLIGHT_MODE so that "am I debugging?" and "is this build going to
-   space?" cannot be confused for one another, and so this temporary state is
-   greppable.  The boot banner reports it (see STR_FLIGHT_MODE below) -- do
-   not trust FLIGHT_MODE=true in the banner to mean the wires are live.
-   =================================================================== */
+/* Temporary debug disarm (added 2026-08-23 for the FLIGHT_MODE boot loop).
+   0 = burn-wire code in task_beacon.c is compiled out even with FLIGHT_MODE=1;
+       everything else in the flight build stays live.
+   1 = normal, FLIGHT_MODE decides.
+   MUST BE 1 FOR FLIGHT.  The boot banner (STR_FLIGHT_MODE) shows this state. */
 #define DEPLOY_ARMED          1
 
-/* Post-power-on hold, seconds.  One constant, two uses, deliberately equal:
-     - the deployer-safety hold before the burn wires may be energised, and
-     - the RF-silence compliance hold before any carrier goes out.
-   Both are measured against OSGetTicks(), which restarts at 0 on every boot,
-   so a reset re-honours the full hold.  The RF half latches once it has been
-   satisfied (deploy_rf_unlock(), see deploy.h) so later reboots transmit
-   immediately; the deploy half is latched separately by the DEPLOYED flag. */
+/* Hold after power-on, seconds, before the burn wires may fire and before any
+   RF transmission.  Measured from OSGetTicks(), so it restarts on every boot.
+   The RF hold latches once satisfied (deploy_rf_unlock() in deploy.h); the
+   deploy hold is latched by the DEPLOYED flag. */
 #define FLIGHT_HOLD_S         125UL
 
-/* Legacy alias.  Its one remaining job is gating the bench-only 'u' / 'p'
-   uplink-injection console commands in task_cmd.c, which stay compiled out of
-   flight builds because of the stale-semaphore phantom-command bug (see
-   "Known issues" in firmware/obc/README.md -- a spurious command must never
-   be able to silence the transmitter on orbit). */
+/* Gates the bench-only 'u'/'p'/'n' uplink-injection commands in task_cmd.c.  They
+   stay out of flight builds because of the phantom-command bug ("Known
+   issues" in firmware/obc/README.md). */
 #define DEVELOPMENT           (!FLIGHT_MODE)
 
 #if FLIGHT_MODE
@@ -82,48 +54,30 @@ $Date: 2011-09-17 22:12:29-07 $
   #define STR_FLIGHT_MODE     "FLIGHT_MODE=false (bench build, deploy disabled)"
 #endif
 
-/* Deployment burn-wire bench test.
-   When 1, task_beacon fires a one-shot deploy pulse 10 s after startup:
-   nichrome gate FETs on IO.24 (RF1) + IO.25 (RF0) are driven HIGH for 10 s,
-   then back LOW.  Runs once per boot, independent of the flight auto-deploy
-   sequence and the persistent DEPLOYED flag (deploy.h) -- it is purely a
-   bench burn test of the FETs / burn wires.
-   !!! Energises nichrome IO.24+IO.25 HIGH for 10 s -- disconnect the burn
-   wires or fit a dummy load.  MUST be 0 for flight / normal bench work. */
+/* Burn-wire bench test.  When 1, task_beacon drives IO.24 (RF1) and IO.25
+   (RF0) high for 10 s, 10 s after startup, once per boot, ignoring the
+   DEPLOYED flag.  Disconnect the burn wires or fit a dummy load.
+   MUST be 0 for flight and normal bench work. */
 #define DEPLOY_TEST_MODE      0
 
 /* ---------------------------------------------------------------------------
    Power management (beacon mode)
    --------------------------------------------------------------------------- */
 
-/* POWER_IDLE = 1 -> main()'s scheduler loop executes PWRSAV #1 (Idle) after
-   every OSSched() pass: the CPU core clock halts until the next interrupt,
-   while Timer2 (opened T2_IDLE_CON), both UARTs, SPI and I2C keep running.
-   Between beacons every task is delayed, so without this the core spins at
-   4 MIPS for the whole gap for no work.
-
-   Deliberately NOT gated on __DEBUG: the MPLAB default configuration defines
-   __DEBUG for ordinary builds too, so keying off it would silently disable
-   idling everywhere.  Set to 0 by hand if an attached ICD/PICkit needs the
-   core running continuously. */
+/* 1 = main() enters Idle (PWRSAV #1) after every OSSched() pass; the core
+   halts until the next interrupt while Timer2, UARTs, SPI and I2C keep
+   running.  Not keyed off __DEBUG because MPLAB defines that for ordinary
+   builds too.  Set to 0 if a debugger needs the core running. */
 #define POWER_IDLE            1
 
-/* Debug-console verbosity.
-   terse (0)   -- one summary line per beacon cycle.
-   verbose (1) -- adds the rails/tumble telemetry lines and the ~6-line AX.25
-                  hex dump of every transmitted frame.
-   That dump is ~500 chars; at 9600 baud it is ~0.5 s per cycle during which
-   uart2_msg_ts busy-waits on TX ring space and the CPU cannot idle, so terse
-   is the default and verbose is a bench aid.  Toggle at runtime with 'q'.
-   The console is not the system of record -- TELEM.CSV on the SD card and the
-   ground-station decode of the actual RF both still carry everything. */
+/* Console verbosity: 0 = one line per beacon cycle, 1 = also rails/tumble
+   lines and an AX.25 hex dump of each frame (~0.5 s of busy-wait at 9600
+   baud).  Toggle at runtime with 'q'. */
 #define CONSOLE_VERBOSE_DEFAULT  0
 
 extern volatile unsigned char g_console_verbose;
 
-/* Idle-fraction instrumentation; see main.c and the 'w' console command.
-   g_idle_counts accumulates Timer1 counts (Fcy/256) spent halted in Idle;
-   g_idle_mark_ticks is the OSGetTicks() value when the window opened. */
+/* Idle-fraction measurement, reported by the 'w' command (see main.c). */
 extern volatile unsigned long g_idle_counts;
 extern volatile unsigned long g_idle_mark_ticks;
 
@@ -151,9 +105,8 @@ extern volatile unsigned long g_idle_mark_ticks;
 // Function declarations.
 extern void init_devices(void);
 
-/* Reset-cause reporting (captured from RCON at the top of init(), see init.c).
-   The condensed byte below rides in every beacon as "rst=%02X" so the ground
-   can tell a watchdog timeout / brownout / trap from an ordinary power-up. */
+/* Reset cause bits, from RCON captured in init().  Sent in the beacon as
+   "rst=%02X". */
 #define RESET_CAUSE_POR        0x01    /* power-on reset                    */
 #define RESET_CAUSE_BOR        0x02    /* brown-out reset                   */
 #define RESET_CAUSE_WDT        0x04    /* watchdog time-out                 */

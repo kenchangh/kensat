@@ -14,7 +14,7 @@ $Revision: 3.2 $
 $Date: 2010-03-28 19:40:15-08 $
 
 ******************************************************************************/
-#include "csk_hw.h"       /* SFR definitions (TMR1) for the idle counter */
+#include "csk_hw.h"       /* TMR1 for the idle counter */
 #include "events.h"
 #include "init.h"
 #include "main.h"
@@ -41,18 +41,14 @@ $Date: 2010-03-28 19:40:15-08 $
 csk_status_t csk_status;
 char strTmp[160];                 // usable to anyone who wants it ...
 
-/* Debug-console verbosity; see CONSOLE_VERBOSE_DEFAULT in main.h.
-   Read by task_beacon (telemetry lines) and task_si4463 (AX.25 hex dump),
-   toggled from the console by the 'q' command. */
+/* See CONSOLE_VERBOSE_DEFAULT in main.h; toggled by 'q'. */
 volatile unsigned char g_console_verbose = CONSOLE_VERBOSE_DEFAULT;
 
-/* Timer1 counts (Fcy/256 = 15625 Hz) accumulated while the core was halted in
-   Idle.  Divided by elapsed Salvo ticks this is the CPU idle fraction -- the
-   only on-board measurement of what POWER_IDLE actually buys, on a board with
-   no current sensing.  Reported and re-zeroed by the 'w' console command. */
+/* Timer1 counts (Fcy/256 = 15625 Hz) spent in Idle.  Reported and cleared
+   by the 'w' command. */
 volatile unsigned long g_idle_counts = 0;
 
-/* Salvo tick at which the current idle-measurement window opened. */
+/* Salvo tick when the idle measurement window opened. */
 volatile unsigned long g_idle_mark_ticks = 0;
 
 
@@ -90,7 +86,7 @@ int main() {
   OSCreateTask(task_sdlog,           TASK_SDLOG_P,            12);
   OSCreateTask(task_beacon,          TASK_BEACON_P,           10);
   OSCreateTask(task_bmi088,          TASK_BMI088_P,           11);
-  OSCreateTask(task_wdt,             TASK_WDT_P,               2); // external TPS3430 watchdog: high priority so its ~54s kick is never starved
+  OSCreateTask(task_wdt,             TASK_WDT_P,               2); // TPS3430 kick; high priority so it is never starved
 
   // Create events.
   OSCreateBinSem(RSRC_USB_MHX_IF_P, 1);    // Initially available
@@ -106,25 +102,15 @@ int main() {
     OSSched();
 
 #if POWER_IDLE
-    // Halt the core until the next interrupt (PWRSAV #1 = Idle mode).
-    //  Timer2 was opened T2_IDLE_CON so the 100 Hz Salvo tick keeps running
-    //  and always wakes us within 10 ms; UART RX/TX interrupts wake us
-    //  immediately, so console responsiveness is unchanged.
-    //
-    //  Note this idles after EVERY pass, not only the ones where no task was
-    //  eligible, so a dispatch can be followed by up to one tick of sleep
-    //  before the next task runs. With six tasks that is ~50 ms of added skew
-    //  in the worst case -- immaterial against task periods of 0.5 s and up,
-    //  and against the ~9 s of late margin task_wdt has on the TPS3430.
-    //  Doing it properly via OSIdlingHook() would mean adding
-    //  Salvo/Src/MCC30/salvohook_idle.c to the build, which the MPLAB makefile
-    //  generator cannot do headless; this needs no build-system change.
+    // Idle until the next interrupt.  The 100 Hz Salvo tick (Timer2,
+    //  T2_IDLE_CON) wakes us within 10 ms; UART interrupts wake us at once.
+    //  This idles after every pass, not just idle ones, adding up to one
+    //  tick of skew per dispatch.  OSIdlingHook() would avoid that but needs
+    //  salvohook_idle.c added to the build.
     {
       unsigned int t1_before = TMR1;
       __builtin_pwrsav(1);
-      // Unsigned 16-bit subtraction, so a TMR1 wrap during the span is
-      //  handled correctly. The span is at most one 10 ms tick (~156 counts)
-      //  against a ~4.19 s wrap period, so it can never alias.
+      // 16-bit unsigned subtraction handles a TMR1 wrap; span <= ~156 counts.
       g_idle_counts += (unsigned long)(unsigned int)(TMR1 - t1_before);
     }
 #endif

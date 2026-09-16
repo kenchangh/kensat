@@ -1,22 +1,16 @@
 /******************************************************************************
 KENSAT - BMI088 IMU Read Task
 
-Wiring (radio board → CubeSat Kit bus):
-  PS=VCC          → I2C protocol mode
-  CSB1=VCC, SDO1=VCC → accel @ 0x19
-  SDO2=VCC        → gyro  @ 0x69 (CSB2 NC; relies on internal pull-up)
-  SDA_SYS/SCL_SYS → PIC24 I2C1 (RG3/RG2)
+Wiring (radio board to CubeSat Kit bus):
+  PS=VCC             I2C mode
+  CSB1=VCC, SDO1=VCC accel @ 0x19
+  SDO2=VCC           gyro  @ 0x69 (CSB2 NC, internal pull-up)
+  SDA_SYS/SCL_SYS    PIC24 I2C1 (RG3/RG2)
 
-Polled. Wakes the sensors, waits out the gyro's start-up, reads accel +
-gyro, then returns both to suspend; repeats every ~5 s.  Raw signed 16-bit
-counts are formatted for the debug console (CSK UART1) but the print is
-currently commented out.
+Every ~5 s: wake both sensors, wait for gyro start-up, read, suspend.
 
-Salvo-on-PIC24 quirk: yielding (OS_Delay) from inside a function that
-this task calls (e.g. bmi088_init()) corrupts the return path back into
-task_bmi088 — the chip resets on the function epilogue. To work around
-this, all delays inside bmi088_init() use a CPU busy-wait (busy_ms())
-instead of OS_Delay. Yields only happen at the top level of the task.
+OS_Delay only works at the task's top level on this Salvo build; yielding
+from a called function resets the chip on return.  Helpers use busy_ms().
 ******************************************************************************/
 #include "main.h"
 #include "task_bmi088.h"
@@ -27,16 +21,14 @@ instead of OS_Delay. Yields only happen at the top level of the task.
 #include <stdio.h>
 
 
-/* Tumbling state, published to task_beacon. BMI088 gyro at ±2000 dps,
-   so per-axis values are clamped to int range with plenty of headroom. */
+/* Gyro rates (dps) and tumble magnitude, read by task_beacon. */
 volatile int          g_gyro_x_dps     = 0;
 volatile int          g_gyro_y_dps     = 0;
 volatile int          g_gyro_z_dps     = 0;
 volatile unsigned int g_tumble_mag_dps = 0;
 
 
-/* Integer square root of an unsigned long. Newton iteration, ~6 iters
-   for any 32-bit input. No <math.h>, no FPU traffic. */
+/* Integer square root (Newton). */
 static unsigned int isqrt_u32(unsigned long n) {
     unsigned long x;
     unsigned long y;
@@ -77,8 +69,8 @@ static unsigned int isqrt_u32(unsigned long n) {
 #define GYR_SOFTRESET          0x14
 
 
-/* Busy-wait approximately n milliseconds at Fcy = 4 MHz. Must be used
-   instead of OS_Delay inside any helper called by task_bmi088. */
+/* Busy-wait ~ms milliseconds at Fcy = 4 MHz.  Use instead of OS_Delay in
+   helpers. */
 static void busy_ms(unsigned int ms) {
     unsigned int i, j;
     for (i = 0; i < ms; i++) {
@@ -106,9 +98,8 @@ static int reg_read(unsigned char addr, unsigned char reg,
 }
 
 
-/* This task does NOT use the shared strTmp / user_debug_msg path —
-   uart2_msg_ts's busy-wait on tx_free was destabilising the system
-   when called from this task. Use csk_uart1_puts() directly. */
+/* Prints go straight to csk_uart1_puts(); the strTmp/user_debug_msg path
+   (busy-wait on tx_free) destabilised the system from this task. */
 static char bmi_buf[96];
 
 static void bmi_print(const char *s) {
@@ -118,51 +109,21 @@ static void bmi_print(const char *s) {
 
 
 /******************************************************************************
- Power management.
-
- The gyro defaults to normal mode and draws ~5 mA continuously -- by far the
- largest steady load on the 3V3 rail after the radio, and pure waste here: the
- beacon consumes gx/gy/gz once per ~12 s cycle and nothing else reads the IMU.
- So the sensors are parked in suspend (gyro ~20 uA, accel ~3 uA) and woken
- only around each sample.
-
- Neither helper delays.  The gyro's start-up wait belongs to the caller and is
- spent as an OS_Delay at the task's top level -- see BMI088_GYR_WAKE_TICKS
- below and the note at the top of this file about yielding from a helper.
+ Power management.  The gyro draws ~5 mA in normal mode, so both sensors sit
+ in suspend (gyro ~20 uA, accel ~3 uA) and are woken only to sample.
 ******************************************************************************/
-/* Start-up allowance between the suspend->normal write and the first read,
-   in 10 ms Salvo ticks (30 = 300 ms).
-
-   The datasheet's 30 ms gyro start-up is the point at which the part becomes
-   operational, NOT the point at which its rate output is within the ~1 dps
-   zero-rate spec.  Reading at 30 ms returns the start-up transient instead
-   of a rate: bench-measured on 2026-08-22, stationary, the readings came out
-   as exact integer multiples of a fixed vector -- raw (4026, -9865, 3075)
-   counts per step -- walking up the ladder sample to sample and clipping at
-   full scale, i.e. up to +/-2000 dps out of a unit sitting still on a desk.
-   That is the bug this constant fixes; it is not sensor drift (a BMI088's
-   zero-rate offset is ~1 dps with a 0.015 dps/K tempco) and not noise.
-
-   Measured on the bench, same boot, gyro otherwise untouched:
-        30 ms  -> 17 dps and climbing; 1598 dps after a spell of normal mode
+/* Gyro wake-to-read delay, 10 ms ticks (300 ms).  The datasheet's 30 ms
+   start-up is not enough: reads at 30 ms gave a stationary unit up to
+   +/-2000 dps of start-up transient.  Bench, 2026-08-22, stationary:
+        30 ms  -> 17 dps and climbing (1598 dps after time in normal mode)
        100 ms  -> 0.2 dps
        300 ms  -> 0.3 dps
        never suspended -> 0.2 dps
-   300 ms is 3x the shortest setting measured good and 10x the datasheet
-   figure.  The margin is close to free: the gyro is ~5 mA awake, so this is
-   6% duty (~0.3 mA) against 5 mA for leaving it in normal mode.  The
-   start-up transient is a mechanical settling process, so re-check this in
-   thermal-vac before flight rather than assuming a bench margin holds cold.
-
-   Spent as an OS_Delay at the task's top level, not busy_ms(): 300 ms of
-   busy-wait every 5 s would burn ~0.36 mA of CPU and defeat POWER_IDLE for
-   6% of the time, which would cost about as much as the gyro saving. */
+   Re-check in thermal-vac. */
 #define BMI088_GYR_WAKE_TICKS  30
 
 static void bmi088_wake(void) {
-    /* Gyro first: its suspend->normal start-up dominates and the accel's
-       (~1 ms) then overlaps it.  NO delay here -- the caller yields for
-       BMI088_GYR_WAKE_TICKS at the task's top level. */
+    /* Gyro first, it has the longer start-up.  Caller does the delay. */
     (void)reg_write(BMI088_GYR_ADDR, GYR_LPM1,     0x00);  /* normal  */
     (void)reg_write(BMI088_ACC_ADDR, ACC_PWR_CONF, 0x00);  /* active  */
 }
@@ -174,9 +135,7 @@ static void bmi088_suspend(void) {
 
 
 /******************************************************************************
- BMI088 init. Returns 0 on success.
-
- Leaves both sensors suspended; the sample loop wakes them per reading.
+ BMI088 init. Returns 0 on success.  Leaves both sensors suspended.
 ******************************************************************************/
 static int bmi088_init(void) {
     unsigned char id;
@@ -186,8 +145,7 @@ static int bmi088_init(void) {
     (void)reg_write(BMI088_ACC_ADDR, ACC_SOFTRESET, 0xB6);
     busy_ms(50);
 
-    /* First I2C transaction after reset can NACK; do a dummy chip-id
-       read and ignore the result, then read again. */
+    /* First I2C transaction after reset can NACK; dummy read first. */
     (void)reg_read(BMI088_ACC_ADDR, ACC_CHIP_ID, &id, 1);
     busy_ms(20);
     rc = reg_read(BMI088_ACC_ADDR, ACC_CHIP_ID, &id, 1);
@@ -205,7 +163,7 @@ static int bmi088_init(void) {
     if (reg_write(BMI088_ACC_ADDR, ACC_PWR_CONF, 0x00) != CSK_I2C_OK) return -3;
     busy_ms(60);
 
-    /* Range ±6 g, ODR 100 Hz / OSR4 */
+    /* Range +/-6 g, ODR 100 Hz / OSR4 */
     (void)reg_write(BMI088_ACC_ADDR, ACC_RANGE, 0x01);
     (void)reg_write(BMI088_ACC_ADDR, ACC_CONF,  0xA8);
 
@@ -222,11 +180,9 @@ static int bmi088_init(void) {
 
     (void)reg_write(BMI088_GYR_ADDR, GYR_SOFTRESET, 0xB6);
     busy_ms(50);
-    (void)reg_write(BMI088_GYR_ADDR, GYR_RANGE,     0x00);  /* ±2000 dps */
+    (void)reg_write(BMI088_GYR_ADDR, GYR_RANGE,     0x00);  /* +/-2000 dps */
     (void)reg_write(BMI088_GYR_ADDR, GYR_BANDWIDTH, 0x07);  /* 100 Hz ODR */
 
-    /* Configured -- park both sensors until the first sample.  No start-up
-       wait needed here: nothing is read before the loop's first wake. */
     bmi088_suspend();
 
     bmi_print("[bmi088] init ok");
@@ -237,14 +193,8 @@ static int bmi088_init(void) {
 /******************************************************************************
  bmi088_get_pwr_state()
 
- Read back the two power-mode registers so the console can confirm the
- sensors really are suspended between samples.  Without this the suspend
- writes are unverifiable: if they silently failed, the readings would look
- exactly the same and the ~5 mA saving would simply not happen.
-
- Both devices answer I2C in suspend (that is how they are woken), so this is
- safe to call at any time.  Expected while idle: GYR_LPM1 = 0x80,
- ACC_PWR_CONF = 0x03.
+ Read back the power-mode registers to confirm suspend.  Safe at any time.
+ Expected while idle: GYR_LPM1 = 0x80, ACC_PWR_CONF = 0x03.
 ******************************************************************************/
 int bmi088_get_pwr_state(unsigned char *gyr_lpm1, unsigned char *acc_pwr_conf) {
     int rc_g = reg_read(BMI088_GYR_ADDR, GYR_LPM1,     gyr_lpm1,     1);
@@ -254,8 +204,8 @@ int bmi088_get_pwr_state(unsigned char *gyr_lpm1, unsigned char *acc_pwr_conf) {
 
 
 /******************************************************************************
- Read 6 axes. BMI088 over I2C does NOT need a dummy byte (that's a
- SPI-only quirk). Read 6 LSB/MSB pairs straight from X_LSB.
+ Read 3 axes (LSB/MSB pairs from X_LSB).  No dummy byte over I2C (that is
+ SPI only).
 ******************************************************************************/
 static int bmi088_read_accel(int *x, int *y, int *z) {
     unsigned char raw[6];
@@ -279,7 +229,7 @@ static int bmi088_read_gyro(int *x, int *y, int *z) {
 
 
 /******************************************************************************
- task_bmi088() — Salvo entry point
+ task_bmi088()
 ******************************************************************************/
 void task_bmi088(void) {
     int ax, ay, az, gx, gy, gz;
@@ -297,12 +247,8 @@ void task_bmi088(void) {
     while (1) {
         __builtin_clrwdt();
 
-        /* Wake, then yield for the gyro's start-up.  The delay has to sit
-           here rather than inside bmi088_wake() for two reasons: OS_Delay
-           must stay at the task's top level (see the note at the top of this
-           file), and yielding lets the core idle through the 300 ms instead
-           of spinning in busy_ms().  Nothing else touches I2C1 or the
-           BMI088, so it is safe to hold the sensors awake across the yield. */
+        /* Yield (not busy-wait) through gyro start-up so the core can idle.
+           Nothing else uses I2C1. */
         bmi088_wake();
         OS_Delay(BMI088_GYR_WAKE_TICKS);
 
@@ -311,9 +257,7 @@ void task_bmi088(void) {
         bmi088_suspend();
 
         if (rc_a == CSK_I2C_OK && rc_g == CSK_I2C_OK) {
-            /* Convert raw gyro counts to deg/s. Range = ±2000 dps over
-               int16, so 1 LSB = 2000/32768 dps ≈ 0.061 dps.
-               dps = raw * 2000 / 32768. */
+            /* dps = raw * 2000 / 32768 */
             int dx = (int)(((long)gx * 2000L) >> 15);
             int dy = (int)(((long)gy * 2000L) >> 15);
             int dz = (int)(((long)gz * 2000L) >> 15);
@@ -336,14 +280,8 @@ void task_bmi088(void) {
         }
         // bmi_print(bmi_buf);
 
-        /* ~5.3 s between samples (5 s here + the 300 ms start-up above).
-           The beacon only publishes gx/gy/gz once per ~12 s cycle, so this is
-           still 2x oversampled, and every second of it is a second the
-           sensors spend suspended.
-           Unrolled deliberately: Salvo Pro-lib delays are 8-bit
-           (OSBYTES_OF_DELAYS=1) so args >255 truncate mod 256, and a for/while
-           loop around OS_Delay corrupts the task on resume -- the delays have
-           to sit at the task's top level. */
+        /* 5 s.  Unrolled: Salvo delays are 8-bit (args > 255 wrap) and a
+           loop around OS_Delay corrupts the task on resume. */
         OS_Delay(100);
         OS_Delay(100);
         OS_Delay(100);

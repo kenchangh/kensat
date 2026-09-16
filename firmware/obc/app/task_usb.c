@@ -97,9 +97,7 @@ void task_usb_talk(void ){
       
     } /* if */
 
-    // Repeat every 5 seconds. Split across two delays because Salvo Pro-lib
-    // delays are 8-bit (OSBYTES_OF_DELAYS=1) and OS_Delay(475) would truncate
-    // mod 256 to 219 ticks. 237 + 238 = 475 ticks (~5 s @ 100 Hz tick).
+    // Repeat every ~5 s.  Two delays because Salvo delays are 8-bit.
     OS_Delay(237);
     OS_Delay(238);
 

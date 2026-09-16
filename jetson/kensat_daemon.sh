@@ -246,7 +246,7 @@ echo "[kensat] Sent READY, waiting for RUN command..." >&2
 #   PROMPT:<text>     run this free-text prompt, uplinked from the ground
 #                     and forwarded verbatim by the OBC
 #
-# The OBC caps an uplinked prompt at 240 chars (JETSON_PROMPT_MAX in
+# The OBC caps an uplinked prompt at 256 chars (JETSON_PROMPT_MAX in
 # firmware/obc/app/task_jetson.h) and reduces it to printable ASCII on one
 # line, so the bound below is a belt-and-braces check on a serial line, not
 # the primary limit.
@@ -257,7 +257,7 @@ line=$(uart_readline 120) || {
 
 line="${line%%$'\r'}"
 
-PROMPT_MAX_CHARS=240
+PROMPT_MAX_CHARS=256
 
 if [[ "$line" =~ ^RUN:([0-9]{2})$ ]]; then
     prompt_id="${BASH_REMATCH[1]}"

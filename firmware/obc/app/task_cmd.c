@@ -50,15 +50,26 @@ task_cmd_do()
 Act on single-character commands:
 
   h|?: help
-  i:   toggle Exercise I/O task on/off
-  m:   cycle between various MCLK output settings
-  n:   inject a two-chunk uplinked LLM prompt + RUN (bench builds only)
+  b:   show boot count
+  c:   Si4463 CW carrier (VNA S11)
+  d:   show antenna deploy state
+  g:   Si4463 / clock diagnostics
+  j:   start Jetson inference, or hard power cut if running
+  k:   clear boot count
+  l:   dump SD card files
+  m:   cycle MCLK output settings
+  n:   inject an LLM PROMPT uplink frame (bench builds only)
+  p:   inject a PING uplink (bench builds only)
+  q:   toggle console verbosity
   r:   restart application
-  q:   toggle debug-console verbosity (terse <-> full)
-  w:   power report: CPU idle %, sensor power state, PMD registers
-  t:   display on-chip temperature
-  v:   display version number
-  z:   go to sleep
+  s:   Si4463 init + RX
+  t:   on-chip temperature
+  u:   inject BCN ON/OFF uplink (bench builds only)
+  v:   version
+  w:   power report: CPU idle %, BMI088 power state, PMD registers
+  x:   Si4463 init + TX
+  y:   clear antenna deployed flag
+  z:   shut down
  
 **                                                                           **
 ****                                                                       ****
@@ -81,9 +92,8 @@ void task_cmd_do(void) {
   
   csk_status.MCLKOutEnabled = 0;
   
-  // Startup status: persistent boot count (program flash) + a fresh VCC_SYS
-  // (3V3) read (the beacon cycle hasn't populated g_rail_3v3_mv yet).
-  // No battery SoC: this board has no battery-sense hardware.
+  // Startup status: boot count and a direct 3V3 read (g_rail_3v3_mv is not
+  // populated yet).
   {
     unsigned int v3 = beacon_read_3v3();
     sprintf(strTmp, STR_TASK_CMD_DO "Boot count = %u, 3V3 = %u mV.",
@@ -109,28 +119,23 @@ void task_cmd_do(void) {
           break;
 
 
-        // Show persistent boot count (stored in program flash).
+        // Show boot count.
         case 'b':
           sprintf(strTmp, STR_TASK_CMD_DO "b: Boot count = %u.", bootcount_get());
           user_debug_msg(strTmp);
           break;
 
 
-        // Clear (zero) the persistent boot count -- run before vibration test.
+        // Clear boot count (run before vibration test).
         case 'k':
           bootcount_reset();
           user_debug_msg(STR_TASK_CMD_DO "k: Boot count cleared to 0.");
           break;
 
 
-        // Dump SD card log files to the console (read the card without
-        // pulling it). sd_dump_file() doesn't yield, so the WHOLE dump is one
-        // uninterruptible stretch -- and at 9600 baud a few KB of TELEM.CSV
-        // easily outruns the ~9 s of late margin task_wdt has before the
-        // TPS3430 resets the OBC. Bench-only command, but that is why the two
-        // tiny counter files are dumped FIRST: they are the ones you usually
-        // want, and they are guaranteed to make it out before the big logs
-        // blow the deadline.
+        // Dump SD files to the console.  sd_dump_file() doesn't yield, so a
+        // large TELEM.CSV can outlast the TPS3430 watchdog margin and reset
+        // the OBC; the small counter files go first so they always get out.
         case 'l':
           user_debug_msg(STR_TASK_CMD_DO "l: Dumping SD files...");
           sd_dump_file("COMMS0.DAT");
@@ -141,7 +146,7 @@ void task_cmd_do(void) {
           break;
 
 
-        // 'd': shows persistent antenna deployment state (program flash).
+        // Show antenna deployment state.
         case 'd':
           sprintf(strTmp,
                   STR_TASK_CMD_DO "d: deployed = %u, attempts = %u, rf_unlocked = %u.",
@@ -150,8 +155,8 @@ void task_cmd_do(void) {
           break;
 
 
-        // Clear the persistent deployment flag -- bench testing only, lets the
-        // burn-wire sequence run again on the next flight-mode boot.
+        // Clear deployment flag (bench only); burn sequence reruns next
+        // flight-mode boot.
         case 'y':
           deploy_reset();
           user_debug_msg(STR_TASK_CMD_DO "y: Antenna deployed flag cleared.");
@@ -165,11 +170,10 @@ void task_cmd_do(void) {
           break;
 
 
-        // 'i' (exercise_io) disabled — task slot reused by task_beacon.
+        // 'i' (exercise_io) disabled; task slot reused by task_beacon.
 
 
-        // Trigger Jetson inference cycle (boot -> infer -> shutdown).
-        // If already running, force a hard power cut instead.
+        // Start a Jetson inference cycle, or hard power cut if already on.
         case 'j':
           if (csk_status.jetson_power_on == FALSE) {
             csk_status.jetson_run_requested = TRUE;
@@ -184,8 +188,7 @@ void task_cmd_do(void) {
           break;
 
 
-        // Toggle MCLCK output for frequency & duty-cycle check.
-        //  This is a highly target-dependent function.
+        // Toggle MCLK output for frequency & duty-cycle check.
         case 'm':
           cmd_mclk();
           break;
@@ -200,12 +203,10 @@ void task_cmd_do(void) {
 
 
 #if DEVELOPMENT
-        // Bench only: fake an uplink telecommand, toggling the beacon
-        //  inhibit through the real command dispatcher.  Compiled out for
-        //  flight (DEVELOPMENT=0) so the phantom-command bug in this task
-        //  -- stale SEM_CMD_CHAR_P counts after a long UART1 response, see
-        //  "Known issues" in firmware/obc/README.md -- can never silence the
-        //  transmitter on orbit.
+        // Bench only: inject BCN ON/OFF through the uplink dispatcher.
+        //  Compiled out of flight builds because of the phantom-command bug
+        //  (stale SEM_CMD_CHAR_P counts; "Known issues" in
+        //  firmware/obc/README.md).
         case 'u':
           if (beacon_inhibited())
             beacon_uplink_inject("KO6IKZ KENSAT1 BCN ON");
@@ -214,23 +215,17 @@ void task_cmd_do(void) {
           break;
 
 
-        // Bench only: fake a PING telecommand (expects an ACK downlink).
+        // Bench only: inject PING (expect an ACK downlink).
         case 'p':
           beacon_uplink_inject("KO6IKZ KENSAT1 PING");
           break;
 
 
-        // Bench only: fake an uplinked LLM prompt -- two chunks plus RUN,
-        //  pushed through the real uplink dispatcher.  Exercises the whole
-        //  chain with no ground transmitter: chunk reassembly, the ACK
-        //  bitmaps, the handoff to task_jetson, "PROMPT:<text>" on the
-        //  payload UART, and then the TXT text downlink of whatever the
-        //  model generates.  Watch for "prompt chunk stored" then
-        //  "COMPLETE, awaiting RUN".
+        // Bench only: inject a PROMPT frame (256-byte NUL-padded field)
+        //  through the uplink dispatcher, exercising ACK, Jetson handoff and
+        //  TXT downlink.  Look for "uplink: PROMPT <n>B h=<crc32>".
         case 'n':
-          beacon_uplink_inject("KO6IKZ KENSAT1 PR 1/2 Describe the Earth ");
-          beacon_uplink_inject("KO6IKZ KENSAT1 PR 2/2 from orbit in one line.");
-          beacon_uplink_inject("KO6IKZ KENSAT1 RUN");
+          beacon_uplink_inject_prompt("Describe the Earth from orbit in one line.");
           break;
 #endif
 
@@ -249,10 +244,7 @@ void task_cmd_do(void) {
           break;
 
 
-        // Toggle debug-console verbosity.  Terse (the default) is one line per
-        //  beacon; verbose adds the rails/tumble lines and the AX.25 hex dump
-        //  of every frame -- ~500 extra chars per cycle, which at 9600 baud is
-        //  ~0.5 s of busy-waited UART in which the CPU cannot idle.
+        // Toggle console verbosity (see CONSOLE_VERBOSE_DEFAULT).
         case 'q':
           g_console_verbose = !g_console_verbose;
           sprintf(strTmp, STR_TASK_CMD_DO "q: console %s.",
@@ -263,16 +255,9 @@ void task_cmd_do(void) {
           break;
 
 
-        // Power report.  Three things, none of which the board can sense
-        //  electrically (there is no current-sense hardware anywhere on it):
-        //   1. CPU idle fraction -- what POWER_IDLE actually buys, measured.
-        //   2. BMI088 power-mode readback -- proves the sensors really are
-        //      suspended between samples rather than the writes silently
-        //      failing, which would look identical from the readings.
-        //   3. PMD registers -- proves the module-disable bits stuck.
-        //  The idle window is re-zeroed on every call, so two 'w's separated
-        //  by an interval measure that interval. Compare terse vs verbose
-        //  ('q') to see what console traffic costs in idle time.
+        // Power report: CPU idle fraction since the last 'w', BMI088 power
+        //  mode readback, and PMD module-disable registers.  The board has no
+        //  current sensing, so this is the only power check.
         case 'w': {
           unsigned long now    = OSGetTicks();
           unsigned long counts = g_idle_counts;
@@ -283,11 +268,9 @@ void task_cmd_do(void) {
           g_idle_mark_ticks = now;
 
           if (span == 0) span = 1;
-          /* Timer1 runs at Fcy/256 = 15625 Hz, so a fully-idle 10 ms tick is
-             156.25 counts and a fully-idle window is span * 156.25.  Hence
-             1000 * counts / (span * 156.25) == counts * 64 / (span * 10),
-             which is tenths of a percent -- no float, and the intermediate
-             stays inside 32 bits for windows of several hours. */
+          /* Timer1 = 15625 Hz, so a 10 ms tick is 156.25 counts.
+             Per-mille idle = 1000 * counts / (span * 156.25)
+                            = counts * 64 / (span * 10). */
           {
             unsigned long permille = (counts * 64UL) / (span * 10UL);
             sprintf(strTmp, STR_TASK_CMD_DO
@@ -335,7 +318,7 @@ void task_cmd_do(void) {
           break;
 
 
-        // Shut down PPM MCU, for static current measurement.         
+        // Shut down PPM MCU, for static current measurement.
         case 'z':
           user_debug_msg(STR_TASK_CMD_DO "z: Full shutdown in 2 s.");
 

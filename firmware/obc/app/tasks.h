@@ -17,7 +17,7 @@ $Date: 2010-01-29 20:04:19-08 $
 #define TASK_CMD_DO_P                           OSTCBP(1) // needs to be cmd #1 (see task_cmd_do())
 //#define TASK_STATUS_MON_P                       OSTCBP(2)
 //#define TASK_ONCHIP_TEMP_P                      OSTCBP(3)
-//#define TASK_EXERCISE_IO_P                      OSTCBP(4)  // disabled — slot reused by task_beacon
+//#define TASK_EXERCISE_IO_P                      OSTCBP(4)  // disabled; slot reused by task_beacon
 //#define TASK_USB_DETECT_P                       OSTCBP(5)
 //#define TASK_USB_TALK_P                         OSTCBP(2) // Disabled
 //#define TASK_MHX_TALK_P                         OSTCBP(7)

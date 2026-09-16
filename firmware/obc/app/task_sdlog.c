@@ -1,10 +1,8 @@
 /******************************************************************************
 KENSAT SD Card Telemetry Logger
 
-Salvo cooperative task. Initializes the SD card via EFFS-THIN (SPI1),
-then logs telemetry to TELEM.CSV every 60 seconds. Also provides
-sd_read_last_telem() so task_beacon can restore Jetson telemetry after
-a reboot.
+Mounts the SD card and logs telemetry to TELEM.CSV every 60 s, inference
+results to INFER.LOG, boots to BOOT.LOG, and beacon counters to COMMS0/1.DAT.
 
 SD card: SPI1, CS on RE5, power on RE4 (both active LOW via csk_sd API).
 Filesystem: HCC EFFS-THIN library 4 (FAT16, superthin, F_MAXFILES=1).
@@ -35,50 +33,40 @@ Filesystem: HCC EFFS-THIN library 4 (FAT16, superthin, F_MAXFILES=1).
 
 /* ---- Configuration ---- */
 #define SDLOG_POLL_TICKS      200       /* 2 s per iteration (fits uint8) */
-#define SDLOG_WRITE_EVERY     30        /* 30 × 2 s = 60 s between CSV rows */
-#define SDLOG_MAX_INIT_RETRIES 3        /* give up (no card) after this many   *
-                                         * failed re-mounts, then idle quietly */
+#define SDLOG_WRITE_EVERY     30        /* 30 x 2 s = 60 s between CSV rows */
+#define SDLOG_MAX_INIT_RETRIES 3        /* then assume no card and stop */
 #define SDLOG_FILE_NAME       "TELEM.CSV"
 #define SDLOG_INFER_FILE      "INFER.LOG"
 #define SDLOG_BOOT_FILE       "BOOT.LOG"
 
-/* Comms counters are checkpointed to a PAIR of tiny files, written
-   alternately (see sd_counters_save()).  EFFS-THIN superthin has no
-   f_rename and can only hold one file open at a time, so a ping-pong pair
-   is how we get an atomic update: the copy we are not writing is always a
-   complete, previously-verified checkpoint, so a power failure part-way
-   through a write can never destroy both. */
+/* Counter checkpoints alternate between two files.  EFFS-THIN superthin has
+   no f_rename, so this is how a power loss mid-write leaves one good copy. */
 #define SDLOG_CTR_FILE_A      "COMMS0.DAT"
 #define SDLOG_CTR_FILE_B      "COMMS1.DAT"
 #define SDLOG_CTR_MAGIC       "KENSAT1"
-#define SDLOG_LINE_MAX        128       /* must hold one whole CSV row + slack */
+#define SDLOG_LINE_MAX        128       /* > one CSV row */
 
-/* CSV header (must fit in strTmp).
-   v3v3sys is the VCC_SYS rail voltage in mV (no vbatt: no battery-sense HW).
-   tumble columns mirror the beacon: per-axis gyro dps + magnitude. */
+/* CSV header (must fit in strTmp).  v3v3sys in mV; gx/gy/gz/tumble in dps. */
 #define SDLOG_CSV_HEADER  "uptime,cpu,gpu,cpu_pk,gpu_pk,pwr_mw,ram_mb,infer_s,load_s,jetson,v3v3sys,gx,gy,gz,tumble\r\n"
 
 
 /* ---- Module state ---- */
 static unsigned char sd_initialized = 0;
-static unsigned char sd_gave_up     = 0;   /* set once no card found -> stop retrying */
+static unsigned char sd_gave_up     = 0;   /* no card found, stop retrying */
 static unsigned char sd_init_retries = 0;
 static unsigned long sd_write_count = 0;
-static unsigned char sd_boot_logged = 0;   /* boot count appended to BOOT.LOG once */
+static unsigned char sd_boot_logged = 0;
 
-/* Which counter file to write next, and the serial stamped into it.  The
-   serial is what tells the two copies apart at boot; it only ever grows. */
+/* Next counter file to write (0 = A, 1 = B) and its serial.  The higher
+   serial is the newer copy. */
 static unsigned char sd_ctr_next   = 0;
 static unsigned long sd_ctr_serial = 0;
-
-
 
 
 /******************************************************************************
  try_sd_mount()
 
- Mount FAT16 volume (call after power-on + delay). Returns 1 on success.
- Does NOT yield — safe to call from task context between OS_Delay calls.
+ Mount the FAT16 volume.  Returns 1 on success.
 ******************************************************************************/
 static unsigned char try_sd_mount(void) {
 
@@ -98,13 +86,8 @@ static unsigned char try_sd_mount(void) {
 /******************************************************************************
  write_boot_log()
 
- Appends one line to BOOT.LOG recording the persistent boot count (from
- program flash) at the uptime this card was mounted. Lets you pull the SD
- card after a vibration test and confirm the OBC didn't reset: the boot
- count should match the last entry and no new lines should appear.
-
- Format:  boot #<n> @ <uptime>s\r\n
- Returns 1 on success, 0 on failure.
+ Append "boot #<n> @ <ms>ms" to BOOT.LOG.  Used to check for OBC resets
+ after vibration testing.  Returns 1 on success.
 ******************************************************************************/
 static unsigned char write_boot_log(void) {
 
@@ -112,8 +95,6 @@ static unsigned char write_boot_log(void) {
     unsigned int len;
     unsigned int written;
 
-    /* Tick = 10 ms (100 Hz), so ms = ticks * 10.  ms (not s) so fast mounts
-       aren't all "0". */
     sprintf(strTmp, "boot #%u @ %lums\r\n",
             bootcount_get(),
             OSGetTicks() * 10UL);
@@ -135,13 +116,9 @@ static unsigned char write_boot_log(void) {
 /******************************************************************************
  sd_counters_parse()
 
- Parse one checkpoint line: "KENSAT1 <serial> <seq> <tx> <rx> <sum>".
- Returns 1 if the line is well formed AND the checksum matches, else 0.
-
- The checksum is what makes a torn write detectable.  f_write is not atomic,
- so a power failure mid-update can leave a short or half-overwritten file;
- without the sum a truncated "KENSAT1 91 12" would parse as a plausible
- (wrong) checkpoint and silently roll the sequence number backwards.
+ Parse "KENSAT1 <serial> <seq> <tx> <rx> <sum>", sum = serial+seq+tx+rx.
+ Returns 1 if well formed and the sum matches.  The sum catches a torn
+ write.
 ******************************************************************************/
 static unsigned char sd_counters_parse(const char *line,
                                        unsigned long *serial,
@@ -167,11 +144,11 @@ static unsigned char sd_counters_parse(const char *line,
             digits++;
         }
         if (digits == 0)
-            return 0;                    /* truncated / not a number */
+            return 0;
     }
 
     if (v[4] != (v[0] + v[1] + v[2] + v[3]))
-        return 0;                        /* torn or corrupted write */
+        return 0;
 
     *serial = v[0];
     *seq    = v[1];
@@ -197,7 +174,7 @@ static unsigned char sd_counters_read_one(const char *name,
     long    nread;
 
     if (f_filelength(name) <= 0)
-        return 0;                        /* missing or empty */
+        return 0;
 
     file = f_open(name, "r");
     if (!file)
@@ -217,20 +194,8 @@ static unsigned char sd_counters_read_one(const char *name,
 /******************************************************************************
  sd_counters_load()
 
- Restore the cumulative beacon counters from the SD card.  Reads both copies
- of the ping-pong pair and takes the one with the higher serial that still
- passes its checksum, so an update interrupted by a power failure falls back
- to the previous complete checkpoint instead of losing the counters.
-
- Returns:
-   SD_CTR_LOADED    a valid checkpoint was found; seq/tx/rx are set
-   SD_CTR_EMPTY     the card is up but holds no valid checkpoint yet
-                    (fresh card, or both copies corrupt) -- start from zero
-   SD_CTR_NO_CARD   the card is not mounted; try again later, and do NOT
-                    save in the meantime or a good checkpoint would be
-                    overwritten with zeros
-
- Does not yield -- safe to call from a Salvo helper.
+ Restore the beacon counters from the valid copy with the higher serial.
+ Returns SD_CTR_LOADED, SD_CTR_EMPTY or SD_CTR_NO_CARD (see task_sdlog.h).
 ******************************************************************************/
 unsigned char sd_counters_load(unsigned long *seq,
                                unsigned long *tx,
@@ -252,8 +217,7 @@ unsigned char sd_counters_load(unsigned long *seq,
         return SD_CTR_EMPTY;
     }
 
-    /* Take the newer valid copy; write the OTHER one next, so the copy we
-       just trusted stays intact until its replacement is complete. */
+    /* Use the newer copy and overwrite the other one next. */
     if (ok_a && (!ok_b || ser_a >= ser_b)) {
         *seq = seq_a; *tx = tx_a; *rx = rx_a;
         sd_ctr_serial = ser_a;
@@ -271,13 +235,8 @@ unsigned char sd_counters_load(unsigned long *seq,
 /******************************************************************************
  sd_counters_save()
 
- Write one checkpoint, alternating between the two copies.  Cheap enough to
- call on every beacon, which is the whole point of keeping these on the card
- rather than in program flash: the sequence number the ground sees is the
- exact one that was last transmitted, with no rounding to a checkpoint
- interval and no risk of a number ever being reused.
-
- Returns 1 on success.  Does not yield -- safe to call from a Salvo helper.
+ Write one checkpoint to the older of the two files.  Called on every
+ beacon.  Returns 1 on success.
 ******************************************************************************/
 unsigned char sd_counters_save(unsigned long seq,
                                unsigned long tx,
@@ -294,14 +253,12 @@ unsigned char sd_counters_save(unsigned long seq,
     sd_ctr_serial++;
     name = sd_ctr_next ? SDLOG_CTR_FILE_B : SDLOG_CTR_FILE_A;
 
-    /* Plain ASCII, one line, so the state is readable by eye when the card
-       is pulled after a test. */
     sprintf(strTmp, SDLOG_CTR_MAGIC " %lu %lu %lu %lu %lu\r\n",
             sd_ctr_serial, seq, tx, rx,
             sd_ctr_serial + seq + tx + rx);
     len = strlen(strTmp);
 
-    file = f_open(name, "w");            /* truncate: keeps the file tiny */
+    file = f_open(name, "w");
     if (!file)
         return 0;
 
@@ -311,7 +268,7 @@ unsigned char sd_counters_save(unsigned long seq,
     if (written != len)
         return 0;
 
-    sd_ctr_next = sd_ctr_next ? 0 : 1;   /* ping-pong for the next save */
+    sd_ctr_next = sd_ctr_next ? 0 : 1;
     return 1;
 }
 
@@ -319,7 +276,7 @@ unsigned char sd_counters_save(unsigned long seq,
 /******************************************************************************
  write_csv_line()
 
- Appends one CSV row to TELEM.CSV. Returns bytes written (0 on error).
+ Append one row to TELEM.CSV.  Returns bytes written (0 on error).
 ******************************************************************************/
 static unsigned int write_csv_line(void) {
 
@@ -328,11 +285,9 @@ static unsigned int write_csv_line(void) {
     unsigned int written;
     unsigned long uptime_s;
 
-    /* Compute uptime from Salvo ticks */
     uptime_s = OSGetTicks() / 100UL;
 
-    /* Format CSV row. 17 fields would overflow strTmp (160 B) if formatted
-       at once, so build it in two halves. */
+    /* Built in two sprintf calls to keep each one small. */
     sprintf(strTmp, "%lu,%d,%d,%d,%d,%u,%u,%u,%u,%u,",
             uptime_s,
             jetson_last_telem.tx.cpu_temp,
@@ -359,7 +314,7 @@ static unsigned int write_csv_line(void) {
         return 0;
     }
 
-    /* Write CSV header on first write to a new file */
+    /* Header on first write to an empty file */
     if (sd_write_count == 0) {
         if (f_filelength(SDLOG_FILE_NAME) == 0) {
             f_write(SDLOG_CSV_HEADER, 1, strlen(SDLOG_CSV_HEADER), file);
@@ -380,7 +335,7 @@ static unsigned int write_csv_line(void) {
 /******************************************************************************
  write_infer_log()
 
- Appends one inference result to INFER.LOG. Format:
+ Append the inference result to INFER.LOG:
    [<uptime>s] P<id> cpu=<c> gpu=<g> pwr=<p>mW infer=<i>s len=<n>\r\n
    <response text>\r\n
    ---\r\n
@@ -392,7 +347,6 @@ static unsigned char write_infer_log(void) {
     unsigned int hdr_len;
     unsigned int written;
 
-    /* Format the header line using strTmp (80 bytes) */
     sprintf(strTmp, "[%lus] P%02u cpu=%d gpu=%d pwr=%u infer=%us len=%u\r\n",
             jetson_infer_result.uptime_s,
             jetson_infer_result.prompt_id,
@@ -410,21 +364,18 @@ static unsigned char write_infer_log(void) {
         return 0;
     }
 
-    /* Write header line */
     written = (unsigned int)f_write(strTmp, 1, hdr_len, file);
     if (written == 0) {
         f_close(file);
         return 0;
     }
 
-    /* Write response body */
     if (jetson_infer_result.response_len > 0) {
         f_write(jetson_infer_result.response, 1,
                 jetson_infer_result.response_len, file);
         f_write("\r\n", 1, 2, file);
     }
 
-    /* Write separator */
     f_write("---\r\n", 1, 5, file);
 
     f_close(file);
@@ -435,14 +386,9 @@ static unsigned char write_infer_log(void) {
 /******************************************************************************
  sd_dump_file()
 
- Reads <name> off the SD card and echoes its raw contents to the debug
- console (UART1). Lets the operator read TELEM.CSV / BOOT.LOG / INFER.LOG
- over the serial link without pulling the card (see the 'l' console cmd).
-
- Cooperative-safe: never yields while the file is open, so task_sdlog cannot
- run and grab the single EFFS-THIN handle (F_MAXFILES=1) mid-dump. Because we
- hold the CPU for the whole dump, task_wdt can't service the external TPS3430,
- so we kick both watchdogs each chunk (extra WDI falling edges are harmless).
+ Print a file from the SD card to the debug console ('l' command).
+ Doesn't yield, so nothing else can take the single EFFS-THIN handle
+ (F_MAXFILES=1); kicks both watchdogs each chunk instead.
 ******************************************************************************/
 void sd_dump_file(const char *name) {
 
@@ -486,9 +432,8 @@ void sd_dump_file(const char *name) {
 /******************************************************************************
  parse_field()
 
- Parse a signed decimal integer from a CSV field, advancing past the
- trailing comma/CR/LF (if present). Returns as unsigned int (caller casts
- to int for signed fields).
+ Parse a signed decimal CSV field and skip a trailing ',', CR, LF.
+ Returned as unsigned; cast to int for signed fields.
 ******************************************************************************/
 static unsigned int parse_field(const char **pp) {
 
@@ -520,11 +465,8 @@ static unsigned int parse_field(const char **pp) {
 /******************************************************************************
  sd_read_last_telem()
 
- Reads the last CSV row from TELEM.CSV and parses it into the provided
- jetson_telem_t struct. Called by task_beacon at startup to restore
- telemetry across reboots.
-
- Returns 1 on success, 0 on failure (file missing, empty, parse error).
+ Load the last TELEM.CSV row into *telem.  Used by task_beacon at startup.
+ Returns 1 on success.
 ******************************************************************************/
 unsigned char sd_read_last_telem(jetson_telem_t *telem) {
 
@@ -548,7 +490,6 @@ unsigned char sd_read_last_telem(jetson_telem_t *telem) {
     if (!file)
         return 0;
 
-    /* Read last SDLOG_LINE_MAX bytes of the file */
     read_start = fsize - SDLOG_LINE_MAX;
     if (read_start < 0)
         read_start = 0;
@@ -562,8 +503,7 @@ unsigned char sd_read_last_telem(jetson_telem_t *telem) {
 
     buf[nread] = '\0';
 
-    /* Find the start of the last complete line.
-       Scan backwards from end for second-to-last '\n'. */
+    /* Last line starts after the second-to-last '\n'. */
     line = NULL;
     for (idx = (int)nread - 2; idx >= 0; idx--) {
         if (buf[idx] == '\n') {
@@ -572,18 +512,14 @@ unsigned char sd_read_last_telem(jetson_telem_t *telem) {
         }
     }
     if (!line) {
-        /* Only one line (or partial) — try from start of buffer */
         line = buf;
     }
 
-    /* Skip if it looks like the header */
-    if (line[0] == 'u')  /* "uptime,..." */
+    if (line[0] == 'u')  /* header row */
         return 0;
 
-    /* Parse: uptime,cpu,gpu,cpu_pk,gpu_pk,pwr,ram,infer,load,jetson */
+    /* uptime,cpu,gpu,cpu_pk,gpu_pk,pwr,ram,infer,load,...; skip uptime */
     p = line;
-
-    /* Skip uptime field */
     while (*p && *p != ',') p++;
     if (*p == ',') p++;
 
@@ -597,7 +533,7 @@ unsigned char sd_read_last_telem(jetson_telem_t *telem) {
     telem->tx.model_load_s  = parse_field(&p);
     telem->timestamp_ticks  = 0;
     telem->valid            = 1;
-    telem->pending_tx       = 0;   /* restored data isn't fresh enough to TX */
+    telem->pending_tx       = 0;   /* restored data is not re-sent */
 
     return 1;
 }
@@ -608,8 +544,7 @@ unsigned char sd_read_last_telem(jetson_telem_t *telem) {
 **                                                                           **
 task_sdlog()
 
-Salvo task entry point. Initializes SD card, then logs telemetry every
-60 seconds.
+Mount the SD card, then poll every 2 s and write a CSV row every 60 s.
 
 **                                                                           **
 ****                                                                       ****
@@ -618,25 +553,20 @@ void task_sdlog(void) {
 
     unsigned int written;
     unsigned int cycle;
-    unsigned long t_mount0;          /* tick stamp when we begin mounting   */
-    unsigned int  mount_ms;          /* how long the successful mount took  */
+    unsigned long t_mount0;
+    unsigned int  mount_ms;
 
     user_debug_msg(STR_TASK_SDLOG "Starting.");
-    OS_Delay(30);    /* brief: let other tasks init (was 2 s) */
+    OS_Delay(30);
 
-    /* Power on SD card and give it a short, spec-adequate settle.
-       SD needs only ~1 ms power ramp + a few hundred clocks; 250 ms is plenty
-       (was 1 s). */
+    /* SD needs ~1 ms ramp plus a few hundred clocks; 250 ms is plenty. */
     csk_sd_pwr_on();
     csk_sd_open();
-    OS_Delay(25);    /* 250 ms power stabilization */
+    OS_Delay(25);
 
-    /* Mount filesystem.  Most of the old "warm-up" came from power-cycling the
-       slot on every miss, which resets the card's init progress.  Instead try
-       f_initvolume a few times back-to-back with short gaps WITHOUT cutting
-       power — a card that just needs another attempt is caught in <1 s.
-       These are unrolled at the task top level (no inner loop) per the Salvo
-       OS_Delay rule. */
+    /* Retry the mount a few times without cutting power (power cycling
+       resets the card's init).  Unrolled to keep OS_Delay out of an inner
+       loop (Salvo). */
     t_mount0 = OSGetTicks();
     if (try_sd_mount())                  sd_initialized = 1;
     if (!sd_initialized) { OS_Delay(10); if (try_sd_mount()) sd_initialized = 1; }
@@ -648,9 +578,6 @@ void task_sdlog(void) {
         sprintf(strTmp, STR_TASK_SDLOG "SD card initialized (mount %u ms).",
                 mount_ms);
         user_debug_msg(strTmp);
-        /* Log this boot immediately rather than waiting a 2 s loop tick.
-           Boot count itself is reported by the startup banner (task_cmd); this
-           is just a confirmation that the SD write succeeded. */
         if (write_boot_log()) {
             sd_boot_logged = 1;
             user_debug_msg(STR_TASK_SDLOG "Logged boot to " SDLOG_BOOT_FILE ".");
@@ -659,44 +586,39 @@ void task_sdlog(void) {
         user_debug_msg(STR_TASK_SDLOG "SD card init failed, will retry.");
     }
 
-    /* Signal that SD card resource is available */
     OSSignalBinSem(RSRC_SD_CARD_P);
 
-    cycle = SDLOG_WRITE_EVERY;   /* trigger first CSV write immediately */
+    cycle = SDLOG_WRITE_EVERY;   /* first CSV write immediately */
 
     while (1) {
 
-        OS_Delay(SDLOG_POLL_TICKS);  /* 2 s — fits in uint8 */
+        OS_Delay(SDLOG_POLL_TICKS);
 
-        /* Retry init if not initialized — full power cycle for hot-insert.
-           Bounded: after SDLOG_MAX_INIT_RETRIES failures we assume no card is
-           present (testing without SD) and stop retrying, so we don't spam the
-           debug UART or power-cycle the SD slot forever. */
+        /* Power-cycle and remount (hot insert), up to SDLOG_MAX_INIT_RETRIES. */
         if (!sd_initialized) {
             if (sd_gave_up)
-                continue;            /* no card — idle quietly */
+                continue;
 
             csk_sd_close();
             csk_sd_pwr_off();
-            OS_Delay(50);    /* 500 ms power-off settle */
+            OS_Delay(50);    /* 500 ms off */
             csk_sd_pwr_on();
             csk_sd_open();
-            OS_Delay(100);   /* 1 s power stabilization */
+            OS_Delay(100);   /* 1 s settle */
             if (try_sd_mount()) {
                 sd_initialized = 1;
                 user_debug_msg(STR_TASK_SDLOG "SD card initialized (retry).");
             } else if (++sd_init_retries >= SDLOG_MAX_INIT_RETRIES) {
                 sd_gave_up = 1;
                 csk_sd_close();
-                csk_sd_pwr_off();    /* leave the slot powered down */
+                csk_sd_pwr_off();
                 user_debug_msg(STR_TASK_SDLOG
                     "No SD card detected; logging disabled for this session.");
             }
             continue;
         }
 
-        /* Record this boot to BOOT.LOG once, the first time the card is up.
-           Survives across the initial mount and the hot-insert retry path. */
+        /* BOOT.LOG once per boot, if the card came up late */
         if (!sd_boot_logged) {
             if (write_boot_log()) {
                 sd_boot_logged = 1;
@@ -704,7 +626,6 @@ void task_sdlog(void) {
             }
         }
 
-        /* Write inference result to INFER.LOG if one is pending (check every 2s) */
         if (jetson_infer_result.pending) {
             jetson_infer_result.pending = 0;
             if (write_infer_log()) {
@@ -715,19 +636,16 @@ void task_sdlog(void) {
             }
         }
 
-        /* Only write telemetry CSV every ~60 s */
         cycle++;
         if (cycle < SDLOG_WRITE_EVERY)
             continue;
         cycle = 0;
 
-        /* Skip if no real Jetson telemetry yet.
-           timestamp_ticks is set to OSGetTicks() (>0) by task_jetson on
-           real telemetry, but left at 0 by sd_read_last_telem(). */
+        /* No fresh Jetson telemetry yet (sd_read_last_telem() leaves
+           timestamp_ticks at 0). */
         if (jetson_last_telem.timestamp_ticks == 0)
             continue;
 
-        /* Write telemetry row */
         written = write_csv_line();
         if (written > 0) {
             sd_write_count++;

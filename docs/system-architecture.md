@@ -70,7 +70,7 @@ A reflash of the `.hex` resets the reserved pages to blank, so a freshly program
      - else → stay silent (console logs `RF silent (uptime …)`).
    - **Transmit** the AX.25 beacon, then any queued Jetson inference frame, then one chunk of a result still being downlinked. TX counters advance only on a real transmission.
    - **Deployment** (flight only, one-shot per boot) fires when *all* hold: `deployed == 0` **and** `attempts < 3` **and** `uptime ≥ 120 s`. It then: bump `attempts` in flash → drive IO.24/IO.25 HIGH for 10 s → drive LOW → set `deployed`. The attempt is recorded *before* the wires energise, so a reset mid-burn still counts toward the 3-try cap. Deployment is GPIO, not RF, so it proceeds normally even during the RF-silence hold.
-   - **Listen** for the rest of the cycle: arm RX, then poll every 400 ms for ~10 s, handling any uplink telecommand that arrives (including prompt chunks).
+   - **Listen** for the rest of the cycle: arm RX, then poll every 400 ms for ~10 s, handling any uplink telecommand that arrives (including an uplinked prompt).
 
 **Key behaviours and edge cases:**
 
@@ -282,10 +282,11 @@ RX, polling every 400 ms. "Having an uplink" on a single-radio spacecraft is
 exactly that — spending the inter-beacon gap listening instead of idle.
 
 Uplink frames use the Si4463's own packet handler (preamble + sync `0x2DD4` +
-1-byte length + payload + CRC-16 CCITT) rather than AX.25: descrambling and
-running HDLC over a raw bit stream in software is something the chip's packet
-handler cannot do for us, and the uplink does not need to be decodable by
-third parties the way the downlink does. Payload is capped at 63 bytes, ASCII:
+2-byte big-endian length + payload + CRC-16 CCITT over length and payload)
+rather than AX.25: descrambling and running HDLC over a raw bit stream in
+software is something the chip's packet handler cannot do for us, and the
+uplink does not need to be decodable by third parties the way the downlink
+does. Payload is up to 300 bytes, ASCII:
 
 ```
 KO6IKZ <AUTH> <VERB>[ <ARG>]
@@ -301,18 +302,39 @@ gate on a command that can silence the spacecraft.
 | `BCN OFF` | Inhibit the transmitter. Persisted in program flash, no auto-expiry, gates **every** transmit path including acknowledgements — so there is no reply; the confirmation is that the carrier stops. |
 | `BCN ON` | Resume beaconing. Acknowledged. |
 | `PING` | Liveness check. Acknowledged. |
-| `PR <k>/<m> <text>` | Chunk *k* of *m* of an uplinked LLM prompt. Acknowledged with a bitmap of the chunks held. |
-| `PR?` / `PRX` | Report / discard the prompt being assembled. |
-| `RUN` | Run an inference now — on the assembled uplinked prompt if complete, else the next library prompt. |
+| `PROMPT <field>` | Run an inference now on the prompt in a fixed 256-byte field. Acknowledged with the prompt's length and CRC-32. |
+| `RUN` | Run an inference now on the next library prompt. |
 | `RUN <id>` | Run library prompt `<id>` (0–19) now. |
 
-**Prompt uplink.** 63 bytes of payload minus the 15-byte command prefix leaves
-48, so a prompt arrives as up to 6 chunks of ≤ 40 characters (240 total),
-reassembled on the OBC. Chunks may arrive in any order and in any number of
-repeats; each is acknowledged with the bitmap of what is held, so the ground
-re-sends only what was lost rather than starting over. The assembly lives in
-RAM only — a reset drops it and the spacecraft falls back to its own prompt
-library, which is the whole reason the library is on board.
+**Prompt uplink.** A prompt goes up whole, in one frame:
+
+```
+"KO6IKZ <AUTH> PROMPT " + field[256]      (278 B payload, 284 B after sync)
+```
+
+The field holds the prompt as printable ASCII, NUL-padded to 256 bytes. A
+field of any other size, a control character, a non-NUL byte after the
+padding, or an empty prompt is NAKed with the reason (`len=`, `char@`,
+`pad@`, `empty`) and never reaches the payload; the fixed size means a frame
+that gained or lost bytes cannot pass as a shorter prompt. A valid prompt
+starts the inference on arrival — there is no separate `RUN` — and the ACK,
+`PROMPT <n>B h=<crc32>`, lets the ground confirm exactly what was received.
+The ground repeats the frame until it hears that: a repeat while the same
+run is still pending is ACKed `dup` instead of queuing a second run, and a
+different prompt while the payload is busy is NAKed `busy`.
+
+The frame is longer than the Si4463's 64-byte RX FIFO (53 ms at 9600 bps)
+and the OBC only polls every 400 ms, so the radio also raises nIRQ on
+preamble/sync detect and the poll that sees one drains the FIFO while the
+frame arrives (`si4463_rx_poll()`; ≤ ~0.9 s of busy-wait, the same order as
+an AX.25 transmission). For the poll to catch the preamble first, the ground
+preamble must outlast the poll period: `ground-station/pluto_tx.py` sends
+768 bytes (640 ms). A frame is accepted only if exactly 2 + length bytes
+came out of the FIFO, so an overflow is a reject, never a truncated command.
+
+The prompt lives in RAM only — a reset drops it and the spacecraft falls
+back to its own prompt library, which is the whole reason the library is on
+board.
 
 **Commanded RF silence.** `BCN OFF` is the one piece of comms state kept in
 program flash rather than on the SD card: the card is removable, socketed, and
@@ -349,7 +371,7 @@ For a prompt uplinked from the ground the OBC substitutes one line and
 nothing else changes:
 
 ```
-PIC24  → Jetson: PROMPT:<text>\n     (≤ 240 chars, one line, printable ASCII)
+PIC24  → Jetson: PROMPT:<text>\n     (≤ 256 chars, one line, printable ASCII)
 ```
 
 The daemon answers identically — `DONE:` + text + `TELEM:` — so there is a
@@ -427,7 +449,7 @@ assumed.
                     │                         │
           ┌────────┴────────┐                 │
           │                 │                 │
-    (uplink RUN / PR)  (24h elapsed?)         │
+  (uplink RUN/PROMPT)  (24h elapsed?)         │
           │                 │                 │
    queue the prompt    (vbatt ≥ 7.0V?)       │
    ACK downlink             │                │

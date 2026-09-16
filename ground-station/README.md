@@ -19,7 +19,7 @@ the link, and run end-to-end tests against the flight hardware.
 
 | Script | Purpose |
 |--------|---------|
-| `pluto_tx.py` | Pluto transmit |
+| `pluto_tx.py` | Pluto transmit: test packets, or telecommands to the OBC (`--cmd PING`, `--prompt "..."` uplinks an LLM prompt in one frame and prints the ACK to expect; `--selftest` needs no radio) |
 | `pluto_cw.py` | CW tone for path / antenna testing |
 | `send_x.py`, `serial_rssi_monitor.py` | Inject test traffic; monitor RSSI over serial |
 
